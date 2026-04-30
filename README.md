@@ -30,6 +30,19 @@ docker compose build
 docker compose up -d
 ```
 
+## Using an existing Redis or Valkey
+
+By default `docker compose up -d` starts a bundled Valkey container. To connect to an existing Redis or Valkey instance instead, set `VALKEY_URL` and start only the `memory-mcp` service:
+
+```bash
+# .env
+VALKEY_URL=redis://your-host:6379
+
+docker compose up -d memory-mcp
+```
+
+Any Redis-compatible server (Redis 6+, Valkey, KeyDB, Upstash via `rediss://`, etc.) works. The server uses only basic data structures: hashes, lists, and sets.
+
 ## Agent setup
 
 Copy `AGENTS.md` from this repo into your project root. It tells your agent how to use the memory tools, what to store, and when.

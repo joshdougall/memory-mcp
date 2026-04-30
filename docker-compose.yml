@@ -43,9 +43,10 @@ services:
     depends_on:
       valkey:
         condition: service_healthy
+        required: false
     environment:
       PORT: "${MEMORY_MCP_PORT:-8000}"
-      VALKEY_URL: "redis://${COMPOSE_PROJECT_NAME:-memory-mcp}-valkey:6379"
+      VALKEY_URL: "${VALKEY_URL:-redis://valkey:6379}"
       AUTH_TOKEN: "${MEMORY_MCP_AUTH_TOKEN:-}"
       MAX_ENTRIES_WARN: "${MEMORY_MCP_MAX_ENTRIES_WARN:-300}"
       MAX_VERSIONS_PER_ENTRY: "${MEMORY_MCP_MAX_VERSIONS_PER_ENTRY:-20}"
