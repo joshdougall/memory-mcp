@@ -2,7 +2,7 @@
 
 Persistent, searchable, versioned memory for AI agents — backed by [Valkey](https://valkey.io) (Redis-compatible), exposed as an [MCP](https://modelcontextprotocol.io) server over HTTP.
 
-Works with any MCP-compatible agent: Claude Code, Cursor, VS Code, Windsurf, and others.
+Works with any MCP-compatible agent: Claude Code, Cursor, VS Code, and others.
 
 ## What it does
 
@@ -85,22 +85,7 @@ Add to `.vscode/mcp.json` in your project:
 }
 ```
 
-### Windsurf
-
-Add to `~/.codeium/windsurf/mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "serverUrl": "http://127.0.0.1:3106/mcp",
-      "headers": { "Authorization": "Bearer your-token" }
-    }
-  }
-}
-```
-
-Omit the `headers` / `Authorization` line if you are not using auth.
+Omit the `headers` / `Authorization` line in any config if you are not using auth.
 
 ## Configuration
 
