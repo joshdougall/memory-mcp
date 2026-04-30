@@ -2,11 +2,11 @@ FROM node:22-slim
 
 WORKDIR /app
 
-COPY package.json .
-RUN npm install --production
+COPY --chown=node:node package*.json .
+RUN npm ci --omit=dev
 
-COPY server.js .
+COPY --chown=node:node server.js .
 
 EXPOSE 8000
-
+USER node
 CMD ["node", "server.js"]

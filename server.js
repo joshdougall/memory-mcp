@@ -23,6 +23,7 @@ const VALKEY_URL = process.env.VALKEY_URL || 'redis://valkey:6379';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const MAX_ENTRIES_WARN = parseInt(process.env.MAX_ENTRIES_WARN || '300', 10);
 const MAX_VERSIONS_PER_ENTRY = parseInt(process.env.MAX_VERSIONS_PER_ENTRY || '20', 10);
+const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(1024 * 1024), 10);
 
 if (AUTH_TOKEN) {
   console.log('[memory-mcp] auth: bearer token required');
@@ -40,7 +41,21 @@ const redis = new Redis(VALKEY_URL, {
 });
 
 redis.on('error', (err) => console.error('[redis] error:', err.message));
-redis.on('connect', () => console.log('[redis] connected to', VALKEY_URL));
+redis.on('connect', () => console.log('[redis] connected to', maskUrl(VALKEY_URL)));
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+function maskUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.password) u.password = '***';
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
 
 // ============================================================================
 // PROMETHEUS METRICS
@@ -88,7 +103,7 @@ const metricHitsZeroCount = new Gauge({
 
 async function refreshGauges() {
   try {
-    const keys = await redis.keys('mem:*');
+    const keys = await scanKeys('mem:*');
     metricEntriesTotal.set(keys.length);
 
     let zeroHits = 0;
@@ -125,6 +140,17 @@ function nowIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
+async function scanKeys(pattern) {
+  const keys = [];
+  let cursor = '0';
+  do {
+    const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    cursor = next;
+    keys.push(...batch);
+  } while (cursor !== '0');
+  return keys;
+}
+
 async function pushVersion(id, fields, operation) {
   const snapshot = JSON.stringify({
     title: fields.title || '',
@@ -143,7 +169,7 @@ async function pushVersion(id, fields, operation) {
 async function removeFromIndexes(id, fields) {
   const pipeline = redis.pipeline();
   if (fields.type) pipeline.srem(`type:${fields.type}`, `mem:${id}`);
-  if (fields.project) pipeline.srem(`project:${fields.project}`, `mem:${id}`);
+  pipeline.srem(`project:${fields.project || ''}`, `mem:${id}`);
   const tags = fields.tags ? fields.tags.split(',').filter(Boolean) : [];
   for (const tag of tags) {
     pipeline.srem(`tag:${tag}`, `mem:${id}`);
@@ -154,7 +180,7 @@ async function removeFromIndexes(id, fields) {
 async function addToIndexes(id, type, project, tags) {
   const pipeline = redis.pipeline();
   if (type) pipeline.sadd(`type:${type}`, `mem:${id}`);
-  if (project) pipeline.sadd(`project:${project}`, `mem:${id}`);
+  pipeline.sadd(`project:${project}`, `mem:${id}`);
   for (const tag of tags) {
     if (tag) pipeline.sadd(`tag:${tag}`, `mem:${id}`);
   }
@@ -166,6 +192,7 @@ function entryToObject(raw) {
     title: raw.title || '',
     body: raw.body || '',
     type: raw.type || '',
+    tags: raw.tags ? raw.tags.split(',').filter(Boolean) : [],
     source: raw.source || '',
     project: raw.project || '',
     created: raw.created || '',
@@ -230,7 +257,7 @@ function buildMcpServer() {
         }
 
         if (candidateKeys === null) {
-          const allKeys = await redis.keys('mem:*');
+          const allKeys = await scanKeys('mem:*');
           candidateKeys = new Set(allKeys);
         }
 
@@ -317,14 +344,18 @@ function buildMcpServer() {
 
       const pipeline = redis.pipeline();
       pipeline.hset(`mem:${id}`, fields);
-      if (isNew && ttl) pipeline.expire(`mem:${id}`, ttl);
+      if (ttl) {
+        pipeline.expire(`mem:${id}`, ttl);
+      } else if (!isNew) {
+        pipeline.persist(`mem:${id}`);
+      }
       await pipeline.exec();
 
       await addToIndexes(id, type, project || '', tags);
       await pushVersion(id, { ...fields }, operation);
       metricWriteTotal.inc();
 
-      const totalKeys = await redis.keys('mem:*');
+      const totalKeys = await scanKeys('mem:*');
       const warning = totalKeys.length > MAX_ENTRIES_WARN
         ? `Entry count (${totalKeys.length}) exceeds soft cap of ${MAX_ENTRIES_WARN}. Consider running memory_prune_candidates.`
         : null;
@@ -357,7 +388,7 @@ function buildMcpServer() {
       }
 
       if (candidateKeys === null) {
-        candidateKeys = new Set(await redis.keys('mem:*'));
+        candidateKeys = new Set(await scanKeys('mem:*'));
       }
 
       const results = [];
@@ -459,7 +490,7 @@ function buildMcpServer() {
     { days: z.number().int().positive().optional().default(30).describe('Entries not updated in this many days are candidates') },
     async ({ days }) => {
       const cutoff = new Date(Date.now() - (days || 30) * 86400000).toISOString().slice(0, 10);
-      const keys = await redis.keys('mem:*');
+      const keys = await scanKeys('mem:*');
       const candidates = [];
 
       for (const key of keys) {
@@ -502,8 +533,14 @@ const httpServer = createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    try {
+      await redis.ping();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (err) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Valkey unavailable' }));
+    }
     return;
   }
 
@@ -511,8 +548,19 @@ const httpServer = createServer(async (req, res) => {
     if (!checkAuth(req, res)) return;
 
     let body = '';
-    req.on('data', (chunk) => { body += chunk; });
+    let bodySize = 0;
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY_BYTES) { tooLarge = true; return; }
+      body += chunk;
+    });
     req.on('end', async () => {
+      if (tooLarge) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32600, message: 'Request too large' }, id: null }));
+        return;
+      }
       let parsed;
       try {
         parsed = JSON.parse(body);
@@ -548,6 +596,6 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[memory-mcp] MCP endpoint:  POST http://0.0.0.0:${PORT}/mcp`);
   console.log(`[memory-mcp] Health:        GET  http://0.0.0.0:${PORT}/health`);
   console.log(`[memory-mcp] Metrics:       GET  http://0.0.0.0:${PORT}/metrics`);
-  console.log(`[memory-mcp] Valkey:        ${VALKEY_URL}`);
+  console.log(`[memory-mcp] Valkey:        ${maskUrl(VALKEY_URL)}`);
   refreshGauges();
 });
