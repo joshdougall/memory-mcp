@@ -1,0 +1,71 @@
+services:
+  valkey:
+    container_name: ${COMPOSE_PROJECT_NAME:-memory-mcp}-valkey
+    image: ${VALKEY_IMAGE:-valkey/valkey:9.0.3}
+    restart: unless-stopped
+    volumes:
+      - valkey-data:/data
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --maxmemory-policy
+      - noeviction
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - memory-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  memory-mcp:
+    container_name: ${COMPOSE_PROJECT_NAME:-memory-mcp}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      valkey:
+        condition: service_healthy
+    environment:
+      PORT: "${MEMORY_MCP_PORT:-8000}"
+      VALKEY_URL: "redis://${COMPOSE_PROJECT_NAME:-memory-mcp}-valkey:6379"
+      AUTH_TOKEN: "${MEMORY_MCP_AUTH_TOKEN:-}"
+      MAX_ENTRIES_WARN: "${MEMORY_MCP_MAX_ENTRIES_WARN:-300}"
+      MAX_VERSIONS_PER_ENTRY: "${MEMORY_MCP_MAX_VERSIONS_PER_ENTRY:-20}"
+    ports:
+      - "${MEMORY_MCP_BIND:-127.0.0.1}:${MEMORY_MCP_HOST_PORT:-3106}:${MEMORY_MCP_PORT:-8000}"
+    mem_limit: ${MEMORY_MCP_MEM_LIMIT:-256m}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - memory-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  valkey-data:
+
+networks:
+  memory-net:
+    driver: bridge
