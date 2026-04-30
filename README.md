@@ -2,7 +2,7 @@
 
 Persistent, searchable, versioned memory for AI agents — backed by [Valkey](https://valkey.io) (Redis-compatible), exposed as an [MCP](https://modelcontextprotocol.io) server over HTTP.
 
-Designed for Claude Code, but works with any MCP-compatible client.
+Works with any MCP-compatible agent: Claude Code, Cursor, VS Code, Windsurf, and others.
 
 ## What it does
 
@@ -17,21 +17,90 @@ Designed for Claude Code, but works with any MCP-compatible client.
 
 ```bash
 cp .env.example .env
+# Optional: set MEMORY_MCP_AUTH_TOKEN in .env (see Auth section)
 docker compose up -d
 ```
 
 The MCP server is now available at `http://127.0.0.1:3106/mcp`.
 
-Register it with Claude Code:
+## Agent setup
+
+Copy `AGENTS.md` from this repo into your project root. It tells your agent how to use the memory tools, what to store, and when.
+
+Then register the MCP server with your agent client:
+
+### Claude Code
 
 ```bash
 # Without auth
 claude mcp add memory --transport http http://127.0.0.1:3106/mcp
 
-# With auth (set MEMORY_MCP_AUTH_TOKEN in .env first)
+# With auth
 claude mcp add memory --transport http http://127.0.0.1:3106/mcp \
-  --header "Authorization: Bearer your-token-here"
+  --header "Authorization: Bearer your-token"
 ```
+
+Or add manually to `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:3106/mcp",
+      "headers": { "Authorization": "Bearer your-token" }
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project):
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "url": "http://127.0.0.1:3106/mcp",
+      "headers": { "Authorization": "Bearer your-token" }
+    }
+  }
+}
+```
+
+### VS Code (GitHub Copilot, MCP extension)
+
+Add to `.vscode/mcp.json` in your project:
+
+```json
+{
+  "servers": {
+    "memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:3106/mcp",
+      "headers": { "Authorization": "Bearer your-token" }
+    }
+  }
+}
+```
+
+### Windsurf
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "serverUrl": "http://127.0.0.1:3106/mcp",
+      "headers": { "Authorization": "Bearer your-token" }
+    }
+  }
+}
+```
+
+Omit the `headers` / `Authorization` line if you are not using auth.
 
 ## Configuration
 
@@ -51,48 +120,25 @@ Copy `.env.example` to `.env` and edit as needed.
 
 By default the server runs unauthenticated. This is safe when bound to loopback (`127.0.0.1`) and accessed only from the local machine.
 
-To enable auth, set `MEMORY_MCP_AUTH_TOKEN` in `.env`:
+To enable auth:
 
 ```bash
 # Generate a token
 openssl rand -hex 32
 
 # Add to .env
-MEMORY_MCP_AUTH_TOKEN=abc123...
+MEMORY_MCP_AUTH_TOKEN=your-generated-token
 
-# Restart
 docker compose up -d
 ```
 
-All requests to `POST /mcp` must include:
+All requests to `POST /mcp` must then include:
+
 ```
 Authorization: Bearer <token>
 ```
 
 `GET /health` and `GET /metrics` are always unauthenticated.
-
-### Registering with a token
-
-**Claude Code CLI:**
-```bash
-claude mcp add memory --transport http http://127.0.0.1:3106/mcp \
-  --header "Authorization: Bearer your-token-here"
-```
-
-**Manual config** (`~/.claude.json`):
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "type": "http",
-      "url": "http://127.0.0.1:3106/mcp",
-      "headers": {
-        "Authorization": "Bearer your-token-here"
-      }
-    }
-  }
-}
-```
 
 ## Available tools
 
@@ -111,26 +157,6 @@ claude mcp add memory --transport http http://127.0.0.1:3106/mcp \
 
 `pattern`, `decision`, `reference`, `feedback`, `incident`, `project`, `entity`, `state`
 
-## CLAUDE.md snippet
-
-Paste this into your project's `CLAUDE.md`:
-
-```markdown
-## Shared Memory (Valkey MCP)
-
-A shared memory MCP server is running at `http://127.0.0.1:3106/mcp`.
-
-**At session start:** Run `memory_search` with tags relevant to the current project before asking the user to re-explain context.
-
-**When to write:** When you discover a pattern, decision, reference, or feedback that applies across sessions. Set `source` to `"claude-code"` and `project` to the current project name (or `""` for cross-project entries).
-
-**When NOT to write:** Ephemeral task state, code patterns obvious from reading the repo, anything already documented in CLAUDE.md.
-
-**Types:** `pattern`, `decision`, `reference`, `feedback`, `incident`, `project`, `entity`, `state`
-
-**Tools:** `memory_search`, `memory_get`, `memory_set`, `memory_list`, `memory_delete`, `memory_history`, `memory_rollback`, `memory_prune_candidates`
-```
-
 ## Endpoints
 
 | Method | Path | Auth | Description |
@@ -141,13 +167,13 @@ A shared memory MCP server is running at `http://127.0.0.1:3106/mcp`.
 
 ## Data model
 
-Each entry is stored as a Redis hash at `mem:<id>` with the following fields:
+Each entry is stored as a Redis hash at `mem:<id>`:
 
 | Field | Description |
 |-------|-------------|
 | `title` | Short descriptive title |
 | `body` | Full content |
-| `type` | Entry type (see above) |
+| `type` | Entry type |
 | `tags` | Comma-separated tag list |
 | `source` | Who wrote it |
 | `project` | Project scope (empty = cross-project) |
