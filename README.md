@@ -21,7 +21,14 @@ cp .env.example .env
 docker compose up -d
 ```
 
-The MCP server is now available at `http://127.0.0.1:3106/mcp`.
+This pulls the pre-built image from GHCR. The MCP server is now available at `http://127.0.0.1:3106/mcp`.
+
+**To build locally instead:**
+
+```bash
+docker compose build
+docker compose up -d
+```
 
 ## Agent setup
 

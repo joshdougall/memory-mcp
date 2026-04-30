@@ -35,6 +35,7 @@ services:
 
   memory-mcp:
     container_name: ${COMPOSE_PROJECT_NAME:-memory-mcp}
+    image: ${MEMORY_MCP_IMAGE:-ghcr.io/joshdougall/memory-mcp:latest}
     build:
       context: .
       dockerfile: Dockerfile
