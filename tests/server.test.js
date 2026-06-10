@@ -777,6 +777,35 @@ describe('memory-mcp ttl cleanup and soft cap', () => {
     await c.close();
   });
 
+  it('rolling back an expired ID persists the inherited version-history TTL', async () => {
+    const c = await client(3109);
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Ephemeral for rollback',
+      body: 'body',
+      type: 'state',
+      tags: [uid()],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+      ttl: 30,
+    });
+    expect(await redis.ttl(`memver:${id}`)).toBeGreaterThan(0);
+
+    // Simulate the entry expiring while its version history is still alive
+    await redis.del(`mem:${id}`);
+
+    const rollback = await call(c, 'memory_rollback', { id, version_index: 0 });
+    expect(rollback.ok).toBe(true);
+
+    // The resurrected entry is permanent; its history must be too
+    expect(await redis.ttl(`mem:${id}`)).toBe(-1);
+    expect(await redis.ttl(`memver:${id}`)).toBe(-1);
+
+    await c.close();
+  });
+
   it('TTL expiry removes version history and index members', async () => {
     const c = await client(3109);
     const id = uid();

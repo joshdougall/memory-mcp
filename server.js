@@ -628,9 +628,23 @@ function buildMcpServer() {
         tags: tags.join(','),
       };
 
+      // Rollback can resurrect an expired or deleted entry
+      if (!existing || !existing.title) entryCount++;
+
       await redis.hset(`mem:${id}`, fields);
       await addToIndexes(id, fields.type, fields.project, tags);
       await pushVersion(id, { ...fields }, `rollback_to_${version_index}`);
+
+      // Align history lifetime with the restored entry: a resurrected
+      // permanent entry must not keep its dead predecessor's memver TTL,
+      // and a still-TTL'd entry keeps history expiring alongside it.
+      const remaining = await redis.ttl(`mem:${id}`);
+      if (remaining > 0) {
+        await redis.expire(`memver:${id}`, remaining);
+      } else {
+        await redis.persist(`memver:${id}`);
+      }
+
       metricWriteTotal.inc();
 
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: `rollback_to_${version_index}`, restored_from: version.updated || 'unknown' }, null, 2) }] };
