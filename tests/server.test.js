@@ -1519,6 +1519,24 @@ describe('memory-mcp configured retention and soft cap', () => {
 });
 
 // ============================================================================
+// GRACEFUL SHUTDOWN TEST (port 3110)
+// ============================================================================
+
+describe('memory-mcp shutdown', () => {
+  it('exits cleanly with code 0 on SIGTERM', async () => {
+    const proc = spawnServer(3110);
+    await waitReady('http://127.0.0.1:3110');
+
+    const code = await new Promise((resolve) => {
+      proc.on('exit', resolve);
+      proc.kill('SIGTERM');
+    });
+
+    expect(code).toBe(0);
+  });
+});
+
+// ============================================================================
 // AUTH SERVER TESTS (port 3108, AUTH_TOKEN=test-secret)
 // ============================================================================
 
@@ -1545,6 +1563,18 @@ describe('memory-mcp auth', () => {
     expect(res.status).toBe(401);
     const body = await res.json();
     expect(body.error).toBe('Unauthorized');
+  });
+
+  it('POST /mcp with a wrong same-length token returns 401', async () => {
+    const res = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-secreT', // same length, wrong value
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 1 }),
+    });
+    expect(res.status).toBe(401);
   });
 
   it('POST /mcp with valid Bearer token succeeds', async () => {
