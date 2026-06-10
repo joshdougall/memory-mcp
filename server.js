@@ -24,6 +24,7 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const MAX_ENTRIES_WARN = parseInt(process.env.MAX_ENTRIES_WARN || '300', 10);
 const MAX_VERSIONS_PER_ENTRY = parseInt(process.env.MAX_VERSIONS_PER_ENTRY || '20', 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(1024 * 1024), 10);
+const BODY_PREVIEW_CHARS = parseInt(process.env.BODY_PREVIEW_CHARS || '300', 10);
 
 if (AUTH_TOKEN) {
   console.log('[memory-mcp] auth: bearer token required');
@@ -107,9 +108,13 @@ async function refreshGauges() {
     metricEntriesTotal.set(keys.length);
 
     let zeroHits = 0;
-    for (const key of keys) {
-      const hits = await redis.hget(key, 'hits');
-      if (!hits || parseInt(hits, 10) === 0) zeroHits++;
+    if (keys.length > 0) {
+      const pipeline = redis.pipeline();
+      for (const key of keys) pipeline.hget(key, 'hits');
+      const replies = await pipeline.exec();
+      for (const [err, hits] of replies) {
+        if (!err && (!hits || parseInt(hits, 10) === 0)) zeroHits++;
+      }
     }
     metricHitsZeroCount.set(zeroHits);
   } catch (err) {
@@ -149,6 +154,31 @@ async function scanKeys(pattern) {
     keys.push(...batch);
   } while (cursor !== '0');
   return keys;
+}
+
+// Batch-fetch entry hashes in one round trip instead of one HGETALL per key.
+// Returns [{ key, raw }] preserving input order; raw is null on a per-key error.
+async function fetchEntries(keys) {
+  const keyList = [...keys];
+  if (keyList.length === 0) return [];
+  const pipeline = redis.pipeline();
+  for (const key of keyList) pipeline.hgetall(key);
+  const replies = await pipeline.exec();
+  return keyList.map((key, i) => ({ key, raw: replies[i][0] ? null : replies[i][1] }));
+}
+
+async function incrementHits(ids) {
+  if (ids.length === 0) return;
+  const pipeline = redis.pipeline();
+  for (const id of ids) pipeline.hincrby(`mem:${id}`, 'hits', 1);
+  await pipeline.exec();
+}
+
+function withBodyPreview(entry, full) {
+  if (full) return entry;
+  const { body, ...rest } = entry;
+  const truncated = body.length > BODY_PREVIEW_CHARS;
+  return { ...rest, body_preview: truncated ? body.slice(0, BODY_PREVIEW_CHARS) : body, truncated };
 }
 
 async function pushVersion(id, fields, operation) {
@@ -214,15 +244,16 @@ function buildMcpServer() {
 
   server.tool(
     'memory_search',
-    'Search memories by tag intersection, type, project, or text substring. Returns entries sorted by hits desc then updated desc.',
+    'Search memories by tag intersection, type, project, or text substring. Returns entries sorted by hits desc then updated desc, with a body_preview by default (pass full: true for complete bodies). Returned entries count as hits.',
     {
       tags: z.array(z.string()).optional().describe('Tag names to intersect (all must match)'),
       type: z.string().optional().describe('Filter by memory type (pattern, decision, reference, feedback, incident, project, entity, state)'),
       project: z.string().optional().describe('Filter by project name (empty string for cross-project)'),
       query: z.string().optional().describe('Substring to match against title and body'),
       limit: z.number().int().positive().optional().default(20).describe('Maximum results to return'),
+      full: z.boolean().optional().default(false).describe('Return complete bodies instead of body_preview'),
     },
-    async ({ tags, type, project, query, limit }) => {
+    async ({ tags, type, project, query, limit, full }) => {
       const end = metricSearchDuration.startTimer();
       metricSearchTotal.inc();
 
@@ -262,8 +293,7 @@ function buildMcpServer() {
         }
 
         const results = [];
-        for (const key of candidateKeys) {
-          const raw = await redis.hgetall(key);
+        for (const { key, raw } of await fetchEntries(candidateKeys)) {
           if (!raw || !raw.title) continue;
 
           if (query) {
@@ -285,8 +315,11 @@ function buildMcpServer() {
         const limited = results.slice(0, limit || 20);
         if (limited.length === 0) metricSearchEmptyTotal.inc();
 
+        await incrementHits(limited.map((r) => r.id));
+        const payload = limited.map((r) => withBodyPreview({ ...r, hits: r.hits + 1 }, full));
+
         return {
-          content: [{ type: 'text', text: JSON.stringify({ count: limited.length, results: limited }, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify({ count: payload.length, results: payload }, null, 2) }],
         };
       } finally {
         end();
@@ -366,14 +399,15 @@ function buildMcpServer() {
 
   server.tool(
     'memory_list',
-    'List memory entries with optional filters. Sorted by hits or last updated.',
+    'List memory entries with optional filters. Sorted by hits or last updated. Returns a body_preview by default (pass full: true for complete bodies). Listing does not count as hits.',
     {
       type: z.string().optional().describe('Filter by memory type'),
       project: z.string().optional().describe('Filter by project'),
       sort: z.enum(['hits', 'updated']).optional().default('hits').describe('Sort order'),
       limit: z.number().int().positive().optional().default(50).describe('Maximum results'),
+      full: z.boolean().optional().default(false).describe('Return complete bodies instead of body_preview'),
     },
-    async ({ type, project, sort, limit }) => {
+    async ({ type, project, sort, limit, full }) => {
       let candidateKeys = null;
 
       if (type) {
@@ -392,8 +426,7 @@ function buildMcpServer() {
       }
 
       const results = [];
-      for (const key of candidateKeys) {
-        const raw = await redis.hgetall(key);
+      for (const { key, raw } of await fetchEntries(candidateKeys)) {
         if (!raw || !raw.title) continue;
         const id = key.replace(/^mem:/, '');
         results.push({ id, ...entryToObject(raw) });
@@ -405,7 +438,8 @@ function buildMcpServer() {
         return (b.updated || '').localeCompare(a.updated || '');
       });
 
-      return { content: [{ type: 'text', text: JSON.stringify({ count: results.slice(0, limit || 50).length, results: results.slice(0, limit || 50) }, null, 2) }] };
+      const payload = results.slice(0, limit || 50).map((r) => withBodyPreview(r, full));
+      return { content: [{ type: 'text', text: JSON.stringify({ count: payload.length, results: payload }, null, 2) }] };
     }
   );
 
@@ -493,8 +527,7 @@ function buildMcpServer() {
       const keys = await scanKeys('mem:*');
       const candidates = [];
 
-      for (const key of keys) {
-        const raw = await redis.hgetall(key);
+      for (const { key, raw } of await fetchEntries(keys)) {
         if (!raw || !raw.title) continue;
         if (parseInt(raw.hits || '0', 10) !== 0) continue;
         if ((raw.updated || '') >= cutoff) continue;

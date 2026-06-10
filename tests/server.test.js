@@ -450,6 +450,154 @@ describe('memory-mcp server', () => {
 
     await c.close();
   });
+
+  // --------------------------------------------------------------------------
+  // memory_search — body preview
+  // --------------------------------------------------------------------------
+
+  it('memory_search returns body_preview by default and full body on request', async () => {
+    const c = await client();
+    const id = uid();
+    const tag = uid();
+    const longBody = 'x'.repeat(500);
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Preview test entry',
+      body: longBody,
+      type: 'reference',
+      tags: [tag],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    });
+
+    const preview = await call(c, 'memory_search', { tags: [tag] });
+    const entry = preview.results.find((r) => r.id === id);
+    expect(entry.body).toBeUndefined();
+    expect(entry.body_preview).toBe('x'.repeat(300));
+    expect(entry.truncated).toBe(true);
+
+    const full = await call(c, 'memory_search', { tags: [tag], full: true });
+    const fullEntry = full.results.find((r) => r.id === id);
+    expect(fullEntry.body).toBe(longBody);
+    expect(fullEntry.body_preview).toBeUndefined();
+
+    await c.close();
+  });
+
+  it('memory_search short bodies are not marked truncated', async () => {
+    const c = await client();
+    const id = uid();
+    const tag = uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Short body entry',
+      body: 'short body',
+      type: 'reference',
+      tags: [tag],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    });
+
+    const result = await call(c, 'memory_search', { tags: [tag] });
+    const entry = result.results.find((r) => r.id === id);
+    expect(entry.body_preview).toBe('short body');
+    expect(entry.truncated).toBe(false);
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // memory_search — hit counting
+  // --------------------------------------------------------------------------
+
+  it('memory_search increments hit counters of returned entries', async () => {
+    const c = await client();
+    const id = uid();
+    const tag = uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Hit count entry',
+      body: 'body',
+      type: 'reference',
+      tags: [tag],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    });
+
+    const first = await call(c, 'memory_search', { tags: [tag] });
+    expect(first.results.find((r) => r.id === id).hits).toBe(1);
+
+    const second = await call(c, 'memory_search', { tags: [tag] });
+    expect(second.results.find((r) => r.id === id).hits).toBe(2);
+
+    // memory_get sees the search-accumulated hits and adds its own
+    const got = await call(c, 'memory_get', { id });
+    expect(got.hits).toBe(3);
+
+    await c.close();
+  });
+
+  it('memory_search does not increment hits of entries beyond the limit', async () => {
+    const c = await client();
+    const tag = uid();
+    const idA = uid();
+    const idB = uid();
+
+    for (const [id, title] of [[idA, 'A'], [idB, 'B']]) {
+      await call(c, 'memory_set', {
+        id,
+        title,
+        body: 'body',
+        type: 'reference',
+        tags: [tag],
+        source: 'test-suite',
+        project: 'memory-mcp-test',
+      });
+    }
+
+    // limit 1 returns one entry; the other must keep hits at 0
+    const result = await call(c, 'memory_search', { tags: [tag], limit: 1 });
+    expect(result.results.length).toBe(1);
+    const returnedId = result.results[0].id;
+    const otherId = returnedId === idA ? idB : idA;
+
+    const other = await call(c, 'memory_get', { id: otherId });
+    expect(other.hits).toBe(1); // 0 from search + 1 from this get
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // memory_list — body preview
+  // --------------------------------------------------------------------------
+
+  it('memory_list returns body_preview by default and full body on request', async () => {
+    const c = await client();
+    const id = uid();
+    const project = 'proj-' + uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'List preview entry',
+      body: 'y'.repeat(500),
+      type: 'reference',
+      tags: [uid()],
+      source: 'test-suite',
+      project,
+    });
+
+    const preview = await call(c, 'memory_list', { project });
+    expect(preview.results[0].body).toBeUndefined();
+    expect(preview.results[0].body_preview).toBe('y'.repeat(300));
+
+    const full = await call(c, 'memory_list', { project, full: true });
+    expect(full.results[0].body).toBe('y'.repeat(500));
+
+    await c.close();
+  });
 });
 
 // ============================================================================

@@ -118,6 +118,7 @@ Copy `.env.example` to `.env` and edit as needed.
 | `MEMORY_MCP_AUTH_TOKEN` | _(empty)_ | Bearer token for `/mcp`. Empty = no auth. Generate: `openssl rand -hex 32` |
 | `MEMORY_MCP_MAX_ENTRIES_WARN` | `300` | Soft cap — warns on write when exceeded |
 | `MEMORY_MCP_MAX_VERSIONS_PER_ENTRY` | `20` | Max version snapshots per entry |
+| `MEMORY_MCP_BODY_PREVIEW_CHARS` | `300` | Length of `body_preview` in search/list results |
 | `MEMORY_MCP_MEM_LIMIT` | `256m` | Container memory cap |
 | `VALKEY_IMAGE` | `valkey/valkey:9.0.3` | Valkey image to use |
 
@@ -149,10 +150,10 @@ Authorization: Bearer <token>
 
 | Tool | Description |
 |------|-------------|
-| `memory_search` | Search by tags (intersection), type, project, or text substring |
-| `memory_get` | Fetch one entry by ID (increments hit counter) |
+| `memory_search` | Search by tags (intersection), type, project, or text substring. Returns `body_preview` by default (`full: true` for complete bodies); returned entries count as hits |
+| `memory_get` | Fetch one entry by ID with full body (increments hit counter) |
 | `memory_set` | Create or update an entry (versioned on every write) |
-| `memory_list` | List entries with optional type/project filter |
+| `memory_list` | List entries with optional type/project filter. Returns `body_preview` by default (`full: true` for complete bodies); does not count as hits |
 | `memory_delete` | Delete an entry (tombstone version written first) |
 | `memory_history` | View version history for an entry |
 | `memory_rollback` | Restore an entry to a previous version |
@@ -184,7 +185,7 @@ Each entry is stored as a Redis hash at `mem:<id>`:
 | `project` | Project scope (empty = cross-project) |
 | `created` | ISO date of creation |
 | `updated` | ISO date of last update |
-| `hits` | Times retrieved via `memory_get` |
+| `hits` | Times served via `memory_get` or returned in `memory_search` results |
 | `ttl` | Expiry in seconds (optional) |
 
 Version history is stored in a Redis list at `memver:<id>` (newest-first, capped at `MAX_VERSIONS_PER_ENTRY`).
