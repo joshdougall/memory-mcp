@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import Redis from 'ioredis';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, '..', 'server.js');
@@ -571,6 +572,66 @@ describe('memory-mcp server', () => {
   });
 
   // --------------------------------------------------------------------------
+  // timestamps
+  // --------------------------------------------------------------------------
+
+  it('entries and versions carry full ISO timestamps', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Timestamp entry',
+      body: 'body',
+      type: 'reference',
+      tags: [uid()],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    });
+
+    const entry = await call(c, 'memory_get', { id });
+    expect(entry.created).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(entry.updated).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+    const history = await call(c, 'memory_history', { id });
+    expect(history.versions[0].updated).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // version dedupe
+  // --------------------------------------------------------------------------
+
+  it('re-saving identical content does not add a version; changed content does', async () => {
+    const c = await client();
+    const id = uid();
+    const entry = {
+      id,
+      title: 'Dedupe entry',
+      body: 'same body',
+      type: 'pattern',
+      tags: ['dedupe-test'],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    };
+
+    await call(c, 'memory_set', entry);
+    await call(c, 'memory_set', entry); // identical re-save
+
+    let history = await call(c, 'memory_history', { id });
+    expect(history.count).toBe(1);
+    expect(history.versions[0].operation).toBe('created');
+
+    await call(c, 'memory_set', { ...entry, body: 'different body' });
+    history = await call(c, 'memory_history', { id });
+    expect(history.count).toBe(2);
+    expect(history.versions[0].operation).toBe('modified');
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
   // memory_list — body preview
   // --------------------------------------------------------------------------
 
@@ -595,6 +656,75 @@ describe('memory-mcp server', () => {
 
     const full = await call(c, 'memory_list', { project, full: true });
     expect(full.results[0].body).toBe('y'.repeat(500));
+
+    await c.close();
+  });
+});
+
+// ============================================================================
+// TTL CLEANUP + SOFT CAP TESTS (port 3109, fast sweep, warn cap 0)
+// ============================================================================
+
+describe('memory-mcp ttl cleanup and soft cap', () => {
+  let proc;
+  let redis;
+  const BASE = 'http://127.0.0.1:3109';
+
+  beforeAll(async () => {
+    proc = spawnServer(3109, { SWEEP_INTERVAL_SECONDS: '1', MAX_ENTRIES_WARN: '0' });
+    redis = new Redis(VALKEY_URL);
+    await waitReady(BASE);
+  });
+
+  afterAll(async () => {
+    proc.kill('SIGTERM');
+    await new Promise((r) => proc.on('exit', r));
+    redis.disconnect();
+  });
+
+  it('memory_set warns when entry count exceeds the soft cap', async () => {
+    const c = await client(3109);
+    const result = await call(c, 'memory_set', {
+      id: uid(),
+      title: 'Cap test entry',
+      body: 'body',
+      type: 'reference',
+      tags: [uid()],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    });
+    await c.close();
+
+    expect(result.warning).toMatch(/soft cap/);
+  });
+
+  it('TTL expiry removes version history and index members', async () => {
+    const c = await client(3109);
+    const id = uid();
+    const tag = uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Ephemeral entry',
+      body: 'body',
+      type: 'state',
+      tags: [tag],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+      ttl: 1,
+    });
+
+    // Entry, version history, and index member all exist while alive
+    expect(await redis.exists(`mem:${id}`)).toBe(1);
+    expect(await redis.exists(`memver:${id}`)).toBe(1);
+    expect(await redis.sismember(`tag:${tag}`, `mem:${id}`)).toBe(1);
+
+    // Wait past the 1s TTL plus a sweep cycle
+    await new Promise((r) => setTimeout(r, 3000));
+
+    expect(await redis.exists(`mem:${id}`)).toBe(0);
+    expect(await redis.exists(`memver:${id}`)).toBe(0);
+    expect(await redis.sismember(`tag:${tag}`, `mem:${id}`)).toBe(0);
 
     await c.close();
   });

@@ -25,6 +25,7 @@ const MAX_ENTRIES_WARN = parseInt(process.env.MAX_ENTRIES_WARN || '300', 10);
 const MAX_VERSIONS_PER_ENTRY = parseInt(process.env.MAX_VERSIONS_PER_ENTRY || '20', 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(1024 * 1024), 10);
 const BODY_PREVIEW_CHARS = parseInt(process.env.BODY_PREVIEW_CHARS || '300', 10);
+const SWEEP_INTERVAL_SECONDS = parseInt(process.env.SWEEP_INTERVAL_SECONDS || '600', 10);
 
 if (AUTH_TOKEN) {
   console.log('[memory-mcp] auth: bearer token required');
@@ -43,6 +44,23 @@ const redis = new Redis(VALKEY_URL, {
 
 redis.on('error', (err) => console.error('[redis] error:', err.message));
 redis.on('connect', () => console.log('[redis] connected to', maskUrl(VALKEY_URL)));
+
+// Atomically remove members of an index set whose mem:<id> hash no longer
+// exists (TTL expiry leaves index members behind). Lua keeps the
+// check-then-remove free of races with concurrent writes.
+redis.defineCommand('sweepIndexSet', {
+  numberOfKeys: 1,
+  lua: `
+    local removed = 0
+    for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+      if redis.call('EXISTS', m) == 0 then
+        redis.call('SREM', KEYS[1], m)
+        removed = removed + 1
+      end
+    end
+    return removed
+  `,
+});
 
 // ============================================================================
 // HELPERS
@@ -102,9 +120,14 @@ const metricHitsZeroCount = new Gauge({
   registers: [registry],
 });
 
+// Entry count cache: refreshed by the 60s gauge scan, adjusted inline on
+// create/delete so the soft-cap warning never needs a keyspace scan.
+let entryCount = 0;
+
 async function refreshGauges() {
   try {
     const keys = await scanKeys('mem:*');
+    entryCount = keys.length;
     metricEntriesTotal.set(keys.length);
 
     let zeroHits = 0;
@@ -124,6 +147,25 @@ async function refreshGauges() {
 
 setInterval(refreshGauges, 60_000);
 
+async function sweepOrphanedIndexes() {
+  try {
+    const indexKeys = [
+      ...(await scanKeys('tag:*')),
+      ...(await scanKeys('type:*')),
+      ...(await scanKeys('project:*')),
+    ];
+    let removed = 0;
+    for (const key of indexKeys) {
+      removed += await redis.sweepIndexSet(key);
+    }
+    if (removed > 0) console.log(`[sweep] removed ${removed} orphaned index member(s)`);
+  } catch (err) {
+    console.error('[sweep] error:', err.message);
+  }
+}
+
+setInterval(sweepOrphanedIndexes, SWEEP_INTERVAL_SECONDS * 1000);
+
 // ============================================================================
 // AUTH MIDDLEWARE
 // ============================================================================
@@ -142,7 +184,7 @@ function checkAuth(req, res) {
 // ============================================================================
 
 function nowIso() {
-  return new Date().toISOString().slice(0, 10);
+  return new Date().toISOString();
 }
 
 async function scanKeys(pattern) {
@@ -182,16 +224,32 @@ function withBodyPreview(entry, full) {
 }
 
 async function pushVersion(id, fields, operation) {
-  const snapshot = JSON.stringify({
+  const content = {
     title: fields.title || '',
     body: fields.body || '',
     type: fields.type || '',
     tags: fields.tags ? fields.tags.split(',').filter(Boolean) : [],
     source: fields.source || 'unknown',
     project: fields.project || '',
-    updated: nowIso(),
-    operation,
-  });
+  };
+
+  // Idempotent re-saves are common for agents; don't burn a version slot
+  // when nothing changed.
+  if (operation === 'modified') {
+    const latest = await redis.lindex(`memver:${id}`, 0);
+    if (latest) {
+      try {
+        const prev = JSON.parse(latest);
+        delete prev.updated;
+        delete prev.operation;
+        if (JSON.stringify(prev) === JSON.stringify(content)) return;
+      } catch {
+        // unparseable snapshot — push a fresh one
+      }
+    }
+  }
+
+  const snapshot = JSON.stringify({ ...content, updated: nowIso(), operation });
   await redis.lpush(`memver:${id}`, snapshot);
   await redis.ltrim(`memver:${id}`, 0, MAX_VERSIONS_PER_ENTRY - 1);
 }
@@ -345,7 +403,7 @@ function buildMcpServer() {
 
   server.tool(
     'memory_set',
-    'Create or update a memory entry. Creates a version snapshot on every write.',
+    'Create or update a memory entry. Creates a version snapshot on every content change (identical re-saves are not versioned).',
     {
       id: z.string().describe('Unique memory ID (slug-style, e.g. ansible-vault-pattern)'),
       title: z.string().describe('Short descriptive title'),
@@ -386,11 +444,20 @@ function buildMcpServer() {
 
       await addToIndexes(id, type, project || '', tags);
       await pushVersion(id, { ...fields }, operation);
-      metricWriteTotal.inc();
 
-      const totalKeys = await scanKeys('mem:*');
-      const warning = totalKeys.length > MAX_ENTRIES_WARN
-        ? `Entry count (${totalKeys.length}) exceeds soft cap of ${MAX_ENTRIES_WARN}. Consider running memory_prune_candidates.`
+      // Version history shares the entry's lifetime: expire alongside a
+      // TTL'd entry, persist when the TTL is removed.
+      if (ttl) {
+        await redis.expire(`memver:${id}`, ttl);
+      } else if (!isNew) {
+        await redis.persist(`memver:${id}`);
+      }
+
+      metricWriteTotal.inc();
+      if (isNew) entryCount++;
+
+      const warning = entryCount > MAX_ENTRIES_WARN
+        ? `Entry count (${entryCount}) exceeds soft cap of ${MAX_ENTRIES_WARN}. Consider running memory_prune_candidates.`
         : null;
 
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation, warning }, null, 2) }] };
@@ -455,6 +522,7 @@ function buildMcpServer() {
       await pushVersion(id, existing, 'deleted');
       await removeFromIndexes(id, existing);
       await redis.del(`mem:${id}`);
+      entryCount = Math.max(0, entryCount - 1);
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted' }, null, 2) }] };
     }
   );
@@ -631,4 +699,5 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[memory-mcp] Metrics:       GET  http://0.0.0.0:${PORT}/metrics`);
   console.log(`[memory-mcp] Valkey:        ${maskUrl(VALKEY_URL)}`);
   refreshGauges();
+  sweepOrphanedIndexes();
 });

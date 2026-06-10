@@ -119,6 +119,7 @@ Copy `.env.example` to `.env` and edit as needed.
 | `MEMORY_MCP_MAX_ENTRIES_WARN` | `300` | Soft cap — warns on write when exceeded |
 | `MEMORY_MCP_MAX_VERSIONS_PER_ENTRY` | `20` | Max version snapshots per entry |
 | `MEMORY_MCP_BODY_PREVIEW_CHARS` | `300` | Length of `body_preview` in search/list results |
+| `MEMORY_MCP_SWEEP_INTERVAL_SECONDS` | `600` | Sweep cadence for index members orphaned by TTL expiry |
 | `MEMORY_MCP_MEM_LIMIT` | `256m` | Container memory cap |
 | `VALKEY_IMAGE` | `valkey/valkey:9.0.3` | Valkey image to use |
 
@@ -152,7 +153,7 @@ Authorization: Bearer <token>
 |------|-------------|
 | `memory_search` | Search by tags (intersection), type, project, or text substring. Returns `body_preview` by default (`full: true` for complete bodies); returned entries count as hits |
 | `memory_get` | Fetch one entry by ID with full body (increments hit counter) |
-| `memory_set` | Create or update an entry (versioned on every write) |
+| `memory_set` | Create or update an entry (versioned on every content change; identical re-saves are not versioned) |
 | `memory_list` | List entries with optional type/project filter. Returns `body_preview` by default (`full: true` for complete bodies); does not count as hits |
 | `memory_delete` | Delete an entry (tombstone version written first) |
 | `memory_history` | View version history for an entry |
@@ -183,12 +184,12 @@ Each entry is stored as a Redis hash at `mem:<id>`:
 | `tags` | Comma-separated tag list |
 | `source` | Who wrote it |
 | `project` | Project scope (empty = cross-project) |
-| `created` | ISO date of creation |
-| `updated` | ISO date of last update |
+| `created` | ISO 8601 timestamp of creation |
+| `updated` | ISO 8601 timestamp of last update |
 | `hits` | Times served via `memory_get` or returned in `memory_search` results |
 | `ttl` | Expiry in seconds (optional) |
 
-Version history is stored in a Redis list at `memver:<id>` (newest-first, capped at `MAX_VERSIONS_PER_ENTRY`).
+Version history is stored in a Redis list at `memver:<id>` (newest-first, capped at `MAX_VERSIONS_PER_ENTRY`). History shares a TTL entry's lifetime: it expires with the entry and is persisted again if the TTL is removed.
 
 Tag, type, and project indexes are Redis sets (`tag:<name>`, `type:<name>`, `project:<name>`).
 
