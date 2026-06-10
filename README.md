@@ -191,7 +191,7 @@ Each entry is stored as a Redis hash at `mem:<id>`:
 
 Version history is stored in a Redis list at `memver:<id>` (newest-first, capped at `MAX_VERSIONS_PER_ENTRY`). History shares a TTL entry's lifetime: it expires with the entry and is persisted again if the TTL is removed.
 
-Tag, type, and project indexes are Redis sets (`tag:<name>`, `type:<name>`, `project:<name>`).
+Tag, type, and project indexes are Redis sets (`tag:<name>`, `type:<name>`, `project:<name>`). A reverse index at `memidx:<id>` records each entry's current memberships so writes can clean up after a TTL'd predecessor expires; it is swept once its entry is gone.
 
 ## License
 

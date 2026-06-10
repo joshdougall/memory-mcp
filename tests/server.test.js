@@ -572,6 +572,50 @@ describe('memory-mcp server', () => {
   });
 
   // --------------------------------------------------------------------------
+  // TTL-expired ID reuse
+  // --------------------------------------------------------------------------
+
+  it('recreating an expired ID does not resurrect stale index memberships', async () => {
+    const c = await client();
+    const id = uid();
+    const oldTag = uid();
+    const newTag = uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'old incarnation',
+      body: 'body',
+      type: 'state',
+      tags: [oldTag],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+      ttl: 1,
+    });
+
+    // Let the entry expire; default sweep cadence (600s) means nothing
+    // cleans the stale index members before the recreate below.
+    await new Promise((r) => setTimeout(r, 1500));
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'new incarnation',
+      body: 'body',
+      type: 'state',
+      tags: [newTag],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    });
+
+    const oldSearch = await call(c, 'memory_search', { tags: [oldTag] });
+    expect(oldSearch.results.map((r) => r.id)).not.toContain(id);
+
+    const newSearch = await call(c, 'memory_search', { tags: [newTag] });
+    expect(newSearch.results.map((r) => r.id)).toContain(id);
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
   // timestamps
   // --------------------------------------------------------------------------
 
@@ -696,6 +740,41 @@ describe('memory-mcp ttl cleanup and soft cap', () => {
     await c.close();
 
     expect(result.warning).toMatch(/soft cap/);
+  });
+
+  it('recreating an expired ID persists the inherited version-history TTL', async () => {
+    const c = await client(3109);
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Ephemeral original',
+      body: 'body',
+      type: 'state',
+      tags: [uid()],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+      ttl: 30,
+    });
+    expect(await redis.ttl(`memver:${id}`)).toBeGreaterThan(0);
+
+    // Simulate the entry expiring while its version history is still alive
+    await redis.del(`mem:${id}`);
+
+    await call(c, 'memory_set', {
+      id,
+      title: 'Permanent recreation',
+      body: 'body',
+      type: 'state',
+      tags: [uid()],
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+    });
+
+    // History of the permanent entry must no longer carry the dead TTL
+    expect(await redis.ttl(`memver:${id}`)).toBe(-1);
+
+    await c.close();
   });
 
   it('TTL expiry removes version history and index members', async () => {

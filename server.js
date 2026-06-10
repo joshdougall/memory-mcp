@@ -62,6 +62,20 @@ redis.defineCommand('sweepIndexSet', {
   `,
 });
 
+// Drop a reverse-index key once its entry is gone. Atomic with the
+// existence check so a concurrent recreate (which rewrites memidx)
+// cannot lose its fresh reverse index.
+redis.defineCommand('sweepReverseIndex', {
+  numberOfKeys: 1,
+  lua: `
+    local id = string.sub(KEYS[1], 8)
+    if redis.call('EXISTS', 'mem:' .. id) == 0 then
+      return redis.call('DEL', KEYS[1])
+    end
+    return 0
+  `,
+});
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -158,7 +172,15 @@ async function sweepOrphanedIndexes() {
     for (const key of indexKeys) {
       removed += await redis.sweepIndexSet(key);
     }
-    if (removed > 0) console.log(`[sweep] removed ${removed} orphaned index member(s)`);
+
+    // Reverse indexes are swept after the sets: a recreate landing
+    // between the two phases rewrites memidx, which the Lua existence
+    // check then leaves in place.
+    for (const key of await scanKeys('memidx:*')) {
+      removed += await redis.sweepReverseIndex(key);
+    }
+
+    if (removed > 0) console.log(`[sweep] removed ${removed} orphaned index record(s)`);
   } catch (err) {
     console.error('[sweep] error:', err.message);
   }
@@ -254,11 +276,32 @@ async function pushVersion(id, fields, operation) {
   await redis.ltrim(`memver:${id}`, 0, MAX_VERSIONS_PER_ENTRY - 1);
 }
 
-async function removeFromIndexes(id, fields) {
+// Remove an ID's current index memberships. The reverse index at
+// memidx:<id> is authoritative because it outlives a TTL'd entry: a
+// recreated ID must clean up memberships left by its expired
+// predecessor, whose hash (and field data) no longer exists. Falls back
+// to the live hash for entries written before memidx existed.
+async function clearIndexMemberships(id, existing) {
+  let type, project, tags;
+
+  const raw = await redis.get(`memidx:${id}`);
+  if (raw) {
+    try {
+      ({ type, project, tags } = JSON.parse(raw));
+    } catch {
+      // corrupted reverse index — fall back to the hash below
+    }
+  }
+  if (tags === undefined && existing && existing.title) {
+    type = existing.type;
+    project = existing.project || '';
+    tags = existing.tags ? existing.tags.split(',').filter(Boolean) : [];
+  }
+  if (tags === undefined) return;
+
   const pipeline = redis.pipeline();
-  if (fields.type) pipeline.srem(`type:${fields.type}`, `mem:${id}`);
-  pipeline.srem(`project:${fields.project || ''}`, `mem:${id}`);
-  const tags = fields.tags ? fields.tags.split(',').filter(Boolean) : [];
+  if (type) pipeline.srem(`type:${type}`, `mem:${id}`);
+  pipeline.srem(`project:${project || ''}`, `mem:${id}`);
   for (const tag of tags) {
     pipeline.srem(`tag:${tag}`, `mem:${id}`);
   }
@@ -272,6 +315,10 @@ async function addToIndexes(id, type, project, tags) {
   for (const tag of tags) {
     if (tag) pipeline.sadd(`tag:${tag}`, `mem:${id}`);
   }
+  pipeline.set(
+    `memidx:${id}`,
+    JSON.stringify({ type: type || '', project: project || '', tags: tags.filter(Boolean) })
+  );
   await pipeline.exec();
 }
 
@@ -420,7 +467,9 @@ function buildMcpServer() {
       const operation = isNew ? 'created' : 'modified';
       const now = nowIso();
 
-      if (!isNew) await removeFromIndexes(id, existing);
+      // Always clear: a "new" ID may be reusing an expired entry's slot
+      // whose index memberships are still present.
+      await clearIndexMemberships(id, existing);
 
       const fields = {
         title, body, type,
@@ -446,10 +495,12 @@ function buildMcpServer() {
       await pushVersion(id, { ...fields }, operation);
 
       // Version history shares the entry's lifetime: expire alongside a
-      // TTL'd entry, persist when the TTL is removed.
+      // TTL'd entry, persist when the TTL is removed. Persist even on
+      // isNew — a recreated ID may inherit a live TTL from its expired
+      // predecessor's history.
       if (ttl) {
         await redis.expire(`memver:${id}`, ttl);
-      } else if (!isNew) {
+      } else {
         await redis.persist(`memver:${id}`);
       }
 
@@ -520,8 +571,8 @@ function buildMcpServer() {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
       await pushVersion(id, existing, 'deleted');
-      await removeFromIndexes(id, existing);
-      await redis.del(`mem:${id}`);
+      await clearIndexMemberships(id, existing);
+      await redis.del(`mem:${id}`, `memidx:${id}`);
       entryCount = Math.max(0, entryCount - 1);
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted' }, null, 2) }] };
     }
@@ -562,7 +613,7 @@ function buildMcpServer() {
       catch { return { content: [{ type: 'text', text: JSON.stringify({ error: 'Could not parse version snapshot' }) }] }; }
 
       const existing = await redis.hgetall(`mem:${id}`);
-      if (existing && existing.title) await removeFromIndexes(id, existing);
+      await clearIndexMemberships(id, existing);
 
       const tags = Array.isArray(version.tags) ? version.tags : [];
       const fields = {
