@@ -581,6 +581,126 @@ describe('memory-mcp server', () => {
     await raw.quit();
     await c.close();
   });
+
+  // --------------------------------------------------------------------------
+  // if_version
+  // --------------------------------------------------------------------------
+
+  it('if_version applies the write when it matches the current revision', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'v1', body: 'b1', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const result = await call(c, 'memory_set', {
+      id, title: 'v2', body: 'b2', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.revision).toBe(2);
+
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('b2');
+
+    await c.close();
+  });
+
+  it('if_version returns a conflict and writes nothing when it does not match', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'v1', body: 'original', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const result = await call(c, 'memory_set', {
+      id, title: 'stale', body: 'should not land', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 99,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('conflict');
+    expect(result.id).toBe(id);
+    expect(result.current_revision).toBe(1);
+    expect(result.expected_version).toBe(99);
+
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('original');
+    expect(after.revision).toBe(1);
+
+    await c.close();
+  });
+
+  it('if_version 0 creates when absent and conflicts when already versioned', async () => {
+    const c = await client();
+    const id = uid();
+
+    const created = await call(c, 'memory_set', {
+      id, title: 'fresh', body: 'b', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(created.ok).toBe(true);
+    expect(created.operation).toBe('created');
+    expect(created.revision).toBe(1);
+
+    const again = await call(c, 'memory_set', {
+      id, title: 'duplicate', body: 'b', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(again.ok).toBe(false);
+    expect(again.error).toBe('conflict');
+    expect(again.current_revision).toBe(1);
+
+    await c.close();
+  });
+
+  it('if_version 0 upgrades a legacy entry that has no revision counter', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    // Seed an entry the way a pre-1.1.0 server would have: hash only, no memrev key.
+    await raw.hset(`mem:${id}`, {
+      title: 'Legacy entry',
+      body: 'written by an older server',
+      type: 'reference',
+      tags: 'legacy',
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+      created: '2026-01-01',
+      updated: '2026-01-01',
+      hits: '7',
+    });
+    expect(await raw.exists(`memrev:${id}`)).toBe(0);
+
+    const upgraded = await call(c, 'memory_set', {
+      id, title: 'Upgraded', body: 'now versioned', type: 'reference',
+      tags: ['legacy'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(upgraded.ok).toBe(true);
+    expect(upgraded.operation).toBe('modified');
+    expect(upgraded.revision).toBe(1);
+
+    // A second if_version 0 now conflicts: the entry is versioned.
+    const second = await call(c, 'memory_set', {
+      id, title: 'again', body: 'b', type: 'reference',
+      tags: ['legacy'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(second.ok).toBe(false);
+    expect(second.error).toBe('conflict');
+
+    await raw.quit();
+    await c.close();
+  });
 });
 
 // ============================================================================

@@ -96,6 +96,12 @@ const metricWriteTotal = new Counter({
   registers: [registry],
 });
 
+const metricConflictTotal = new Counter({
+  name: 'memory_conflict_total',
+  help: 'Total number of memory_set calls rejected by an if_version mismatch',
+  registers: [registry],
+});
+
 const metricHitsZeroCount = new Gauge({
   name: 'memory_hits_zero_count',
   help: 'Number of memory entries with 0 hits (bloat indicator)',
@@ -448,8 +454,9 @@ function buildMcpServer() {
       source: z.string().optional().default('unknown').describe('Who created/updated this entry'),
       project: z.string().optional().default('').describe('Project scope (empty = cross-project)'),
       ttl: z.number().int().positive().optional().describe('Seconds until expiry (omit for permanent)'),
+      if_version: z.number().int().min(0).optional().describe('Compare-and-set: apply only if the current revision equals this. 0 means create-if-absent. Omit for an unconditional write.'),
     },
-    async ({ id, title, body, type, tags, source, project, ttl }) => {
+    async ({ id, title, body, type, tags, source, project, ttl, if_version }) => {
       const result = JSON.parse(await redis.memorySetAtomic(
         `mem:${id}`,
         `memver:${id}`,
@@ -466,10 +473,15 @@ function buildMcpServer() {
         nowIso(),
         ttl ? String(ttl) : '',
         String(MAX_VERSIONS_PER_ENTRY),
-        '',
+        if_version === undefined ? '' : String(if_version),
         '0',
         String(OPERATION_ID_TTL_SECONDS)
       ));
+
+      if (result.status === 'conflict') {
+        metricConflictTotal.inc();
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'conflict', id, current_revision: result.current_revision, expected_version: result.expected_version }, null, 2) }] };
+      }
 
       metricWriteTotal.inc();
 
