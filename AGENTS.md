@@ -48,12 +48,29 @@ Do not write:
 |------|-------------|
 | `memory_search` | Filter by tags (intersection), type, project, or text |
 | `memory_get` | Fetch one entry by ID — increments hit counter |
-| `memory_set` | Create or update an entry — versioned on every write |
+| `memory_set` | Create or update an entry — versioned on every write, optional compare-and-set |
 | `memory_list` | List entries with optional type/project filter |
 | `memory_delete` | Delete an entry (tombstone version written first) |
 | `memory_history` | View version history for an entry |
 | `memory_rollback` | Restore an entry to a previous version |
 | `memory_prune_candidates` | Surface zero-hit stale entries for review (read-only) |
+
+## Safe concurrent writes
+
+If several agents or machines may write the same entry, pass the `revision` you read from
+`memory_get` back as `if_version`:
+
+```
+memory_get(id="my-entry")                     -> { ..., "revision": 7 }
+memory_set(id="my-entry", ..., if_version=7)
+```
+
+A mismatch returns `{"ok": false, "error": "conflict", "current_revision": N}` and writes
+nothing. Re-read the entry, recompose your change against the current body, and retry with
+the revision the conflict reported. Do not replay your original body.
+
+For retry-safety across a crash, pass a unique `operation_id`. Replaying it returns the
+original result with `"replayed": true` and writes nothing.
 
 ## Conventions
 
