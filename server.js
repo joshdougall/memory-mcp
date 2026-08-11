@@ -444,7 +444,7 @@ function buildMcpServer() {
 
   server.tool(
     'memory_set',
-    'Create or update a memory entry. Creates a version snapshot on every write.',
+    'Create or update a memory entry. Creates a version snapshot on every applied write. Pass if_version for a compare-and-set against the revision from memory_get, and operation_id to make a retry idempotent.',
     {
       id: z.string().describe('Unique memory ID (slug-style, e.g. ansible-vault-pattern)'),
       title: z.string().describe('Short descriptive title'),
