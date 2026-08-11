@@ -961,6 +961,115 @@ describe('memory-mcp server', () => {
     await raw.quit();
     await c.close();
   });
+
+  // --------------------------------------------------------------------------
+  // concurrency
+  // --------------------------------------------------------------------------
+
+  it('N concurrent writers holding the same revision produce exactly one winner', async () => {
+    const setup = await client();
+    const id = uid();
+    await call(setup, 'memory_set', {
+      id, title: 'Contended', body: 'base', type: 'pattern',
+      tags: ['race'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await setup.close();
+
+    const WRITERS = 8;
+    const clients = await Promise.all(
+      Array.from({ length: WRITERS }, () => client())
+    );
+
+    const results = await Promise.all(
+      clients.map((c, i) => call(c, 'memory_set', {
+        id, title: `writer-${i}`, body: `body-${i}`, type: 'pattern',
+        tags: ['race'], source: 'test-suite', project: 'memory-mcp-test',
+        if_version: 1,
+      }))
+    );
+
+    await Promise.all(clients.map((c) => c.close()));
+
+    const winners = results.filter((r) => r.ok === true);
+    const losers = results.filter((r) => r.ok === false);
+
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(WRITERS - 1);
+    expect(winners[0].revision).toBe(2);
+    losers.forEach((l) => {
+      expect(l.error).toBe('conflict');
+      expect(l.expected_version).toBe(1);
+      expect(l.current_revision).toBe(2);
+    });
+
+    // The stored entry is exactly one writer's, with no interleaved fields.
+    const verify = await client();
+    const final = await call(verify, 'memory_get', { id });
+    await verify.close();
+
+    expect(final.revision).toBe(2);
+    // The stored title and body must come from the same writer. If the fields
+    // interleaved, title would name one writer and body another.
+    expect(final.title).toMatch(/^writer-\d+$/);
+    const writerIndex = final.title.replace('writer-', '');
+    expect(final.body).toBe(`body-${writerIndex}`);
+  });
+
+  it('concurrent unconditional writers leave no interleaved index state', async () => {
+    // The previous test passes even if the requests happen to serialise. This one
+    // does not: it targets the read-then-reindex sequence that the old pipeline
+    // performed non-atomically. Each writer swaps the entry onto its own tag, so
+    // afterwards exactly one tag set may contain the entry. A non-atomic path can
+    // interleave an SREM of one writer's tag with another's SADD and strand the
+    // entry in several tag sets at once.
+    const WRITERS = 10;
+    const id = uid();
+    const tags = Array.from({ length: WRITERS }, () => uid());
+
+    const setup = await client();
+    await call(setup, 'memory_set', {
+      id, title: 'Reindexed concurrently', body: 'base', type: 'pattern',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await setup.close();
+
+    const clients = await Promise.all(
+      Array.from({ length: WRITERS }, () => client())
+    );
+
+    const results = await Promise.all(
+      clients.map((c, i) => call(c, 'memory_set', {
+        id, title: `writer-${i}`, body: `body-${i}`, type: 'pattern',
+        tags: [tags[i]], source: 'test-suite', project: 'memory-mcp-test',
+      }))
+    );
+    await Promise.all(clients.map((c) => c.close()));
+
+    // Every write applied, and each got its own revision: no two writers can
+    // observe the same counter value.
+    results.forEach((r) => expect(r.ok).toBe(true));
+    const revisions = results.map((r) => r.revision).sort((a, b) => a - b);
+    expect(new Set(revisions).size).toBe(WRITERS);
+    expect(revisions).toEqual(Array.from({ length: WRITERS }, (_, i) => i + 2));
+
+    // Exactly one tag set still points at the entry.
+    const raw = rawClient();
+    const memberships = [];
+    for (const tag of tags) {
+      if (await raw.sismember(`tag:${tag}`, `mem:${id}`)) memberships.push(tag);
+    }
+    await raw.quit();
+
+    expect(memberships).toHaveLength(1);
+
+    // And it is the tag belonging to whichever writer landed last.
+    const verify = await client();
+    const final = await call(verify, 'memory_get', { id });
+    await verify.close();
+
+    expect(final.tags).toEqual(memberships);
+    expect(final.revision).toBe(WRITERS + 1);
+  });
 });
 
 // ============================================================================
