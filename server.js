@@ -455,13 +455,14 @@ function buildMcpServer() {
       project: z.string().optional().default('').describe('Project scope (empty = cross-project)'),
       ttl: z.number().int().positive().optional().describe('Seconds until expiry (omit for permanent)'),
       if_version: z.number().int().min(0).optional().describe('Compare-and-set: apply only if the current revision equals this. 0 means create-if-absent. Omit for an unconditional write.'),
+      operation_id: z.string().min(1).max(200).optional().describe('Idempotency key. Replaying a recorded id returns the original result and writes nothing. Retained for 7 days.'),
     },
-    async ({ id, title, body, type, tags, source, project, ttl, if_version }) => {
+    async ({ id, title, body, type, tags, source, project, ttl, if_version, operation_id }) => {
       const result = JSON.parse(await redis.memorySetAtomic(
         `mem:${id}`,
         `memver:${id}`,
         `memrev:${id}`,
-        '',
+        operation_id ? `memop:${operation_id}` : '',
         id,
         title,
         body,
@@ -474,13 +475,17 @@ function buildMcpServer() {
         ttl ? String(ttl) : '',
         String(MAX_VERSIONS_PER_ENTRY),
         if_version === undefined ? '' : String(if_version),
-        '0',
+        operation_id ? '1' : '0',
         String(OPERATION_ID_TTL_SECONDS)
       ));
 
       if (result.status === 'conflict') {
         metricConflictTotal.inc();
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'conflict', id, current_revision: result.current_revision, expected_version: result.expected_version }, null, 2) }] };
+      }
+
+      if (result.status === 'replayed') {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id: result.id, operation: result.operation, revision: result.revision, replayed: true }, null, 2) }] };
       }
 
       metricWriteTotal.inc();

@@ -701,6 +701,104 @@ describe('memory-mcp server', () => {
     await raw.quit();
     await c.close();
   });
+
+  // --------------------------------------------------------------------------
+  // operation_id
+  // --------------------------------------------------------------------------
+
+  it('replaying an operation_id returns the prior result and writes nothing', async () => {
+    const c = await client();
+    const id = uid();
+    const opId = 'op-' + uid();
+
+    const first = await call(c, 'memory_set', {
+      id, title: 'once', body: 'first body', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(first.ok).toBe(true);
+    expect(first.revision).toBe(1);
+    expect(first.replayed).toBeUndefined();
+
+    // Same operation_id, different content: must be a no-op returning the first outcome.
+    const replay = await call(c, 'memory_set', {
+      id, title: 'twice', body: 'second body', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(replay.ok).toBe(true);
+    expect(replay.replayed).toBe(true);
+    expect(replay.revision).toBe(1);
+    expect(replay.operation).toBe('created');
+
+    // Nothing moved: body unchanged, revision unchanged, no second version.
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('first body');
+    expect(after.revision).toBe(1);
+
+    const history = await call(c, 'memory_history', { id });
+    expect(history.count).toBe(1);
+
+    await c.close();
+  });
+
+  it('a replay wins over a stale if_version rather than conflicting', async () => {
+    const c = await client();
+    const id = uid();
+    const opId = 'op-' + uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'v1', body: 'b', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    // A conditional write that succeeds, carrying an operation_id.
+    const applied = await call(c, 'memory_set', {
+      id, title: 'v2', body: 'b2', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1, operation_id: opId,
+    });
+    expect(applied.ok).toBe(true);
+    expect(applied.revision).toBe(2);
+
+    // The client never saw the ack and retries verbatim. if_version 1 is now
+    // stale, but the recorded operation_id must short-circuit ahead of the CAS.
+    const retry = await call(c, 'memory_set', {
+      id, title: 'v2', body: 'b2', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1, operation_id: opId,
+    });
+    expect(retry.ok).toBe(true);
+    expect(retry.replayed).toBe(true);
+    expect(retry.revision).toBe(2);
+
+    await c.close();
+  });
+
+  it('operation_id records expire after the retention window', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+    const opId = 'op-' + uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'ttl check', body: 'b', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+
+    const ttl = await raw.ttl(`memop:${opId}`);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(7 * 24 * 60 * 60);
+
+    const recorded = await raw.hgetall(`memop:${opId}`);
+    expect(recorded.memory_id).toBe(id);
+    expect(recorded.revision).toBe('1');
+    expect(recorded.action).toBe('created');
+
+    await raw.quit();
+    await c.close();
+  });
 });
 
 // ============================================================================
