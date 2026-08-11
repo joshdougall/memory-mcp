@@ -895,6 +895,72 @@ describe('memory-mcp server', () => {
 
     await c.close();
   });
+
+  // --------------------------------------------------------------------------
+  // conflict isolation
+  // --------------------------------------------------------------------------
+
+  it('a conflict touches nothing and is counted as a conflict, not a write', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+    const tag = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Untouchable', body: 'original', type: 'pattern',
+      tags: [tag], source: 'test-suite', project: 'memory-mcp-test', ttl: 600,
+    });
+    await call(c, 'memory_get', { id }); // hits -> 1
+
+    const before = {
+      hash: await raw.hgetall(`mem:${id}`),
+      versions: await raw.lrange(`memver:${id}`, 0, -1),
+      tagMembers: await raw.smembers(`tag:${tag}`),
+      typeMembers: await raw.smembers('type:pattern'),
+      rev: await raw.get(`memrev:${id}`),
+      ttl: await raw.ttl(`mem:${id}`),
+      writes: await metric(BASE, 'memory_write_total'),
+      conflicts: await metric(BASE, 'memory_conflict_total'),
+    };
+
+    const conflict = await call(c, 'memory_set', {
+      id, title: 'Rejected', body: 'must not land', type: 'decision',
+      tags: [uid()], source: 'test-suite', project: 'other-project',
+      if_version: 42,
+    });
+    expect(conflict.ok).toBe(false);
+    expect(conflict.error).toBe('conflict');
+
+    const after = {
+      hash: await raw.hgetall(`mem:${id}`),
+      versions: await raw.lrange(`memver:${id}`, 0, -1),
+      tagMembers: await raw.smembers(`tag:${tag}`),
+      typeMembers: await raw.smembers('type:pattern'),
+      rev: await raw.get(`memrev:${id}`),
+      ttl: await raw.ttl(`mem:${id}`),
+      writes: await metric(BASE, 'memory_write_total'),
+      conflicts: await metric(BASE, 'memory_conflict_total'),
+    };
+
+    // No hash field moved, including hits.
+    expect(after.hash).toEqual(before.hash);
+    // No version pushed.
+    expect(after.versions).toEqual(before.versions);
+    // No index set touched.
+    expect(after.tagMembers.sort()).toEqual(before.tagMembers.sort());
+    expect(after.typeMembers.sort()).toEqual(before.typeMembers.sort());
+    // Revision did not move.
+    expect(after.rev).toBe(before.rev);
+    // TTL was not refreshed or cleared.
+    expect(after.ttl).toBeLessThanOrEqual(before.ttl);
+    expect(after.ttl).toBeGreaterThan(0);
+    // Counted as a conflict, not a write.
+    expect(after.writes).toBe(before.writes);
+    expect(after.conflicts).toBe(before.conflicts + 1);
+
+    await raw.quit();
+    await c.close();
+  });
 });
 
 // ============================================================================
