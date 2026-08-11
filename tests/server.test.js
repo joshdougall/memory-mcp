@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import Redis from 'ioredis';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, '..', 'server.js');
@@ -56,6 +57,19 @@ async function call(c, name, args = {}) {
 
 function uid() {
   return 'test-' + Math.random().toString(36).slice(2);
+}
+
+// Direct Valkey access, for asserting raw keys the MCP API does not expose.
+function rawClient() {
+  return new Redis(VALKEY_URL, { lazyConnect: false });
+}
+
+// Scrape a single unlabelled counter/gauge value from /metrics.
+async function metric(base, name) {
+  const res = await fetch(`${base}/metrics`);
+  const text = await res.text();
+  const line = text.split('\n').find((l) => l.startsWith(`${name} `));
+  return line ? parseFloat(line.split(' ')[1]) : 0;
 }
 
 // ============================================================================
@@ -448,6 +462,123 @@ describe('memory-mcp server', () => {
     expect(after.title).toBe('Original');
     expect(after.body).toBe('original body');
 
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // revision counter
+  // --------------------------------------------------------------------------
+
+  it('memory_set starts revision at 1 and increments once per write', async () => {
+    const c = await client();
+    const id = uid();
+
+    const created = await call(c, 'memory_set', {
+      id, title: 'Rev 1', body: 'b', type: 'pattern',
+      tags: ['rev-test'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(created.ok).toBe(true);
+    expect(created.revision).toBe(1);
+
+    const modified = await call(c, 'memory_set', {
+      id, title: 'Rev 2', body: 'b', type: 'pattern',
+      tags: ['rev-test'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(modified.ok).toBe(true);
+    expect(modified.revision).toBe(2);
+
+    await c.close();
+  });
+
+  it('memory_get returns revision and does not move it despite counting hits', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Get rev', body: 'b', type: 'pattern',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const first = await call(c, 'memory_get', { id });
+    expect(first.revision).toBe(1);
+    expect(first.hits).toBe(1);
+
+    const second = await call(c, 'memory_get', { id });
+    expect(second.revision).toBe(1);
+    expect(second.hits).toBe(2);
+
+    await c.close();
+  });
+
+  it('version snapshots record the revision they were written at', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Snap 1', body: 'b1', type: 'pattern',
+      tags: ['snap'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await call(c, 'memory_set', {
+      id, title: 'Snap 2', body: 'b2', type: 'pattern',
+      tags: ['snap'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const history = await call(c, 'memory_history', { id });
+    await c.close();
+
+    expect(history.versions[0].rev).toBe(2);
+    expect(history.versions[1].rev).toBe(1);
+  });
+
+  it('memory_set preserves created date, tags array and index membership across updates', async () => {
+    const c = await client();
+    const id = uid();
+    const oldTag = uid();
+    const newTag = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Indexed', body: 'b', type: 'pattern',
+      tags: [oldTag], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    const before = await call(c, 'memory_get', { id });
+
+    await call(c, 'memory_set', {
+      id, title: 'Reindexed', body: 'b', type: 'decision',
+      tags: [newTag], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    const after = await call(c, 'memory_get', { id });
+
+    // created date carries over, tags round-trip as an array
+    expect(after.created).toBe(before.created);
+    expect(after.tags).toEqual([newTag]);
+
+    // old tag index no longer points at the entry, new one does
+    const oldSearch = await call(c, 'memory_search', { tags: [oldTag] });
+    expect(oldSearch.results.map((r) => r.id)).not.toContain(id);
+    const newSearch = await call(c, 'memory_search', { tags: [newTag] });
+    expect(newSearch.results.map((r) => r.id)).toContain(id);
+
+    await c.close();
+  });
+
+  it('memory_set with a ttl sets an expiry, and a later write without one clears it', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Expiring', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test', ttl: 600,
+    });
+    expect(await raw.ttl(`mem:${id}`)).toBeGreaterThan(0);
+
+    await call(c, 'memory_set', {
+      id, title: 'Permanent', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(await raw.ttl(`mem:${id}`)).toBe(-1);
+
+    await raw.quit();
     await c.close();
   });
 });
