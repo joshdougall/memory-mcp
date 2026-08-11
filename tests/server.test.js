@@ -582,6 +582,31 @@ describe('memory-mcp server', () => {
     await c.close();
   });
 
+  it('an entry with no tags round-trips as an empty array, not an object', async () => {
+    // Regression guard. The version snapshot's tags array is encoded in JS and
+    // passed into the Lua script pre-encoded, because cjson encodes an empty Lua
+    // table as {} rather than []. Encoding it inside the script would silently
+    // turn a tagless entry's history into an object.
+    const c = await client();
+    const id = uid();
+
+    const created = await call(c, 'memory_set', {
+      id, title: 'No tags', body: 'b', type: 'pattern',
+      tags: [], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(created.ok).toBe(true);
+
+    const got = await call(c, 'memory_get', { id });
+    expect(Array.isArray(got.tags)).toBe(true);
+    expect(got.tags).toEqual([]);
+
+    const history = await call(c, 'memory_history', { id });
+    expect(Array.isArray(history.versions[0].tags)).toBe(true);
+    expect(history.versions[0].tags).toEqual([]);
+
+    await c.close();
+  });
+
   // --------------------------------------------------------------------------
   // if_version
   // --------------------------------------------------------------------------
