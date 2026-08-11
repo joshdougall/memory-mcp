@@ -1413,74 +1413,13 @@ git commit -m "docs: document if_version and operation_id, bump to 1.1.0"
 
 ---
 
-## Task 8: Forgejo canonical, GitHub push-mirror
+## Task 8: Git hosting topology
 
-Independent of the code. Do it last so a remote change never blocks the implementation.
+Deliberately not specified here. This repository is public, and the maintainer's git hosting
+layout (canonical remote, mirror configuration, credentials) is operational detail that does
+not belong in a public artifact. It is tracked outside the repository.
 
-**Files:** none in the repo. This is remote and git config only.
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces: `origin` pointing at Forgejo, `github` pointing at GitHub.
-
-- [ ] **Step 1: Confirm the current state**
-
-```bash
-git remote -v
-git branch --show-current
-git status --short
-```
-
-Expected: `origin` on GitHub, branch `feat/if-version-and-operation-id`, clean tree.
-
-- [ ] **Step 2: Create the repository on Forgejo**
-
-Create `memory-mcp` under Josh's Forgejo user at `forgejo.dougall.ca`, **public**, with no auto-init (no README, no .gitignore, no LICENSE) so the push is not fighting an initial commit.
-
-- [ ] **Step 3: Rename the remotes**
-
-```bash
-git remote rename origin github
-git remote add origin https://forgejo.dougall.ca/josh/memory-mcp.git
-git remote -v
-```
-
-Expected: `origin` -> Forgejo, `github` -> GitHub.
-
-- [ ] **Step 4: Push everything to Forgejo**
-
-```bash
-git push -u origin main
-git push -u origin feat/if-version-and-operation-id
-git push origin --tags
-```
-
-- [ ] **Step 5: Configure the push mirror in Forgejo**
-
-In the Forgejo repo, Settings -> Repository -> Mirror Settings, add a **push** mirror:
-
-- Remote URL: `https://github.com/joshdougall/memory-mcp.git`
-- Username: `joshdougall`
-- Password: a GitHub PAT with `repo` scope
-- Enable "Sync when commits are pushed"
-
-**Do not commit the PAT anywhere.** It lives only in Forgejo's mirror config.
-
-- [ ] **Step 6: Verify the mirror round-trips**
-
-Push a trivial commit to Forgejo, then confirm it appears on GitHub within a minute or two.
-
-```bash
-git push origin feat/if-version-and-operation-id
-git fetch github
-git log --oneline -1 github/feat/if-version-and-operation-id
-```
-
-Expected: the GitHub ref matches the Forgejo push. GitHub Actions CI and the GHCR release workflow keep working unchanged, because the code still lands on GitHub.
-
-- [ ] **Step 7: Record the topology**
-
-Note in `README.md` under a short `## Development` heading, or leave the repo docs alone and record it in Valkey memory as a `reference` entry tagged `["memory-mcp", "git", "forgejo"]`. Prefer the memory entry: the topology is Josh's workflow, not something a public consumer of the image needs.
+Nothing in Tasks 1 to 7 depends on it.
 
 ---
 
