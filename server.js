@@ -24,6 +24,7 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const MAX_ENTRIES_WARN = parseInt(process.env.MAX_ENTRIES_WARN || '300', 10);
 const MAX_VERSIONS_PER_ENTRY = parseInt(process.env.MAX_VERSIONS_PER_ENTRY || '20', 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(1024 * 1024), 10);
+const OPERATION_ID_TTL_SECONDS = parseInt(process.env.OPERATION_ID_TTL_SECONDS || String(7 * 24 * 60 * 60), 10);
 
 if (AUTH_TOKEN) {
   console.log('[memory-mcp] auth: bearer token required');
@@ -95,6 +96,12 @@ const metricWriteTotal = new Counter({
   registers: [registry],
 });
 
+const metricConflictTotal = new Counter({
+  name: 'memory_conflict_total',
+  help: 'Total number of memory_set calls rejected by an if_version mismatch',
+  registers: [registry],
+});
+
 const metricHitsZeroCount = new Gauge({
   name: 'memory_hits_zero_count',
   help: 'Number of memory entries with 0 hits (bloat indicator)',
@@ -151,7 +158,7 @@ async function scanKeys(pattern) {
   return keys;
 }
 
-async function pushVersion(id, fields, operation) {
+async function pushVersion(id, fields, operation, rev) {
   const snapshot = JSON.stringify({
     title: fields.title || '',
     body: fields.body || '',
@@ -161,6 +168,7 @@ async function pushVersion(id, fields, operation) {
     project: fields.project || '',
     updated: nowIso(),
     operation,
+    rev,
   });
   await redis.lpush(`memver:${id}`, snapshot);
   await redis.ltrim(`memver:${id}`, 0, MAX_VERSIONS_PER_ENTRY - 1);
@@ -203,13 +211,133 @@ function entryToObject(raw) {
 }
 
 // ============================================================================
+// LUA: ATOMIC memory_set
+// ============================================================================
+
+// A pipeline batches round trips but is not atomic, and a compare-and-set needs
+// to read the revision and conditionally abort in the same breath. EVAL is
+// atomic in Valkey, so the replay check, the revision check and the write either
+// all happen or none do.
+//
+// KEYS: 1 mem:<id>  2 memver:<id>  3 memrev:<id>  4 memop:<operation_id> ('' when unused)
+// ARGV: 1 id  2 title  3 body  4 type  5 tagsCsv  6 tagsJson  7 source
+//       8 project  9 now  10 ttl  11 maxVersions  12 ifVersion  13 hasOp  14 opTtl
+//
+// Index set names are derived inside the script rather than passed as keys. This
+// server already assumes a single (non-cluster) Valkey: memory_search SINTERs
+// across tag: keys that would hash to different slots.
+const MEMORY_SET_LUA = `
+local memKey, verKey, revKey, opKey = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+
+local id          = ARGV[1]
+local title       = ARGV[2]
+local body        = ARGV[3]
+local mtype       = ARGV[4]
+local tagsCsv     = ARGV[5]
+local tagsJson    = ARGV[6]
+local source      = ARGV[7]
+local project     = ARGV[8]
+local now         = ARGV[9]
+local ttl         = ARGV[10]
+local maxVersions = tonumber(ARGV[11])
+local ifVersion   = ARGV[12]
+local hasOp       = ARGV[13] == '1'
+local opTtl       = tonumber(ARGV[14])
+
+local function splitCsv(csv)
+  local out = {}
+  for item in string.gmatch(csv or '', '([^,]+)') do out[#out + 1] = item end
+  return out
+end
+
+-- 1. Replay: an already recorded operation_id returns its outcome and writes nothing.
+if hasOp then
+  local rec = redis.call('HMGET', opKey, 'memory_id', 'revision', 'action')
+  if rec[1] then
+    return cjson.encode({
+      status = 'replayed',
+      id = rec[1],
+      revision = tonumber(rec[2]),
+      operation = rec[3],
+    })
+  end
+end
+
+-- 2. Compare-and-set. A missing counter reads as 0, so if_version 0 means
+--    "create if absent", and also upgrades a legacy entry that predates this field.
+local currentRev = tonumber(redis.call('GET', revKey) or '0')
+if ifVersion ~= '' and currentRev ~= tonumber(ifVersion) then
+  return cjson.encode({
+    status = 'conflict',
+    id = id,
+    current_revision = currentRev,
+    expected_version = tonumber(ifVersion),
+  })
+end
+
+-- 3. Apply.
+local flat = redis.call('HGETALL', memKey)
+local prev = {}
+for i = 1, #flat, 2 do prev[flat[i]] = flat[i + 1] end
+local isNew = prev.title == nil
+local operation = isNew and 'created' or 'modified'
+
+if not isNew then
+  if prev.type and prev.type ~= '' then redis.call('SREM', 'type:' .. prev.type, memKey) end
+  redis.call('SREM', 'project:' .. (prev.project or ''), memKey)
+  for _, t in ipairs(splitCsv(prev.tags)) do redis.call('SREM', 'tag:' .. t, memKey) end
+end
+
+local newRev = redis.call('INCR', revKey)
+
+redis.call('HSET', memKey,
+  'title', title,
+  'body', body,
+  'type', mtype,
+  'source', source,
+  'project', project,
+  'updated', now,
+  'hits', isNew and '0' or (prev.hits or '0'),
+  'ttl', ttl,
+  'tags', tagsCsv,
+  'created', isNew and now or (prev.created or now))
+
+if ttl ~= '' then
+  redis.call('EXPIRE', memKey, tonumber(ttl))
+elseif not isNew then
+  redis.call('PERSIST', memKey)
+end
+
+if mtype ~= '' then redis.call('SADD', 'type:' .. mtype, memKey) end
+redis.call('SADD', 'project:' .. project, memKey)
+for _, t in ipairs(splitCsv(tagsCsv)) do redis.call('SADD', 'tag:' .. t, memKey) end
+
+-- tagsJson arrives pre-encoded from the caller: cjson encodes an empty Lua table
+-- as {} rather than [], which would corrupt the tags array in history.
+redis.call('LPUSH', verKey, string.format(
+  '{"title":%s,"body":%s,"type":%s,"tags":%s,"source":%s,"project":%s,"updated":%s,"operation":%s,"rev":%d}',
+  cjson.encode(title), cjson.encode(body), cjson.encode(mtype), tagsJson,
+  cjson.encode(source), cjson.encode(project), cjson.encode(now), cjson.encode(operation), newRev))
+redis.call('LTRIM', verKey, 0, maxVersions - 1)
+
+if hasOp then
+  redis.call('HSET', opKey, 'memory_id', id, 'revision', newRev, 'action', operation)
+  redis.call('EXPIRE', opKey, opTtl)
+end
+
+return cjson.encode({ status = 'ok', id = id, revision = newRev, operation = operation })
+`;
+
+redis.defineCommand('memorySetAtomic', { numberOfKeys: 4, lua: MEMORY_SET_LUA });
+
+// ============================================================================
 // MCP SERVER
 // ============================================================================
 
 function buildMcpServer() {
   const server = new McpServer({
     name: 'memory-mcp',
-    version: '1.0.0',
+    version: '1.1.0',
   });
 
   server.tool(
@@ -303,16 +431,20 @@ function buildMcpServer() {
       if (!raw || !raw.title) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
-      await redis.hincrby(`mem:${id}`, 'hits', 1);
+      const pipe = await redis.pipeline()
+        .hincrby(`mem:${id}`, 'hits', 1)
+        .get(`memrev:${id}`)
+        .exec();
+      const revision = parseInt((pipe && pipe[1] && pipe[1][1]) || '0', 10);
       const entry = entryToObject(raw);
       entry.hits += 1;
-      return { content: [{ type: 'text', text: JSON.stringify({ id, ...entry }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ id, ...entry, revision }, null, 2) }] };
     }
   );
 
   server.tool(
     'memory_set',
-    'Create or update a memory entry. Creates a version snapshot on every write.',
+    'Create or update a memory entry. Creates a version snapshot on every applied write. Pass if_version for a compare-and-set against the revision from memory_get, and operation_id to make a retry idempotent.',
     {
       id: z.string().describe('Unique memory ID (slug-style, e.g. ansible-vault-pattern)'),
       title: z.string().describe('Short descriptive title'),
@@ -322,37 +454,40 @@ function buildMcpServer() {
       source: z.string().optional().default('unknown').describe('Who created/updated this entry'),
       project: z.string().optional().default('').describe('Project scope (empty = cross-project)'),
       ttl: z.number().int().positive().optional().describe('Seconds until expiry (omit for permanent)'),
+      if_version: z.number().int().min(0).optional().describe('Compare-and-set: apply only if the current revision equals this. 0 means create-if-absent. Omit for an unconditional write.'),
+      operation_id: z.string().min(1).max(200).optional().describe('Idempotency key. Replaying a recorded id returns the original result and writes nothing. Retained for 7 days.'),
     },
-    async ({ id, title, body, type, tags, source, project, ttl }) => {
-      const existing = await redis.hgetall(`mem:${id}`);
-      const isNew = !existing || !existing.title;
-      const operation = isNew ? 'created' : 'modified';
-      const now = nowIso();
+    async ({ id, title, body, type, tags, source, project, ttl, if_version, operation_id }) => {
+      const result = JSON.parse(await redis.memorySetAtomic(
+        `mem:${id}`,
+        `memver:${id}`,
+        `memrev:${id}`,
+        operation_id ? `memop:${operation_id}` : '',
+        id,
+        title,
+        body,
+        type,
+        tags.join(','),
+        JSON.stringify(tags),
+        source || 'unknown',
+        project || '',
+        nowIso(),
+        ttl ? String(ttl) : '',
+        String(MAX_VERSIONS_PER_ENTRY),
+        if_version === undefined ? '' : String(if_version),
+        operation_id ? '1' : '0',
+        String(OPERATION_ID_TTL_SECONDS)
+      ));
 
-      if (!isNew) await removeFromIndexes(id, existing);
-
-      const fields = {
-        title, body, type,
-        source: source || 'unknown',
-        project: project || '',
-        updated: now,
-        hits: isNew ? '0' : (existing.hits || '0'),
-        ttl: ttl ? String(ttl) : '',
-        tags: tags.join(','),
-        created: isNew ? now : (existing.created || now),
-      };
-
-      const pipeline = redis.pipeline();
-      pipeline.hset(`mem:${id}`, fields);
-      if (ttl) {
-        pipeline.expire(`mem:${id}`, ttl);
-      } else if (!isNew) {
-        pipeline.persist(`mem:${id}`);
+      if (result.status === 'conflict') {
+        metricConflictTotal.inc();
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'conflict', id, current_revision: result.current_revision, expected_version: result.expected_version }, null, 2) }] };
       }
-      await pipeline.exec();
 
-      await addToIndexes(id, type, project || '', tags);
-      await pushVersion(id, { ...fields }, operation);
+      if (result.status === 'replayed') {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id: result.id, operation: result.operation, revision: result.revision, replayed: true }, null, 2) }] };
+      }
+
       metricWriteTotal.inc();
 
       const totalKeys = await scanKeys('mem:*');
@@ -360,7 +495,7 @@ function buildMcpServer() {
         ? `Entry count (${totalKeys.length}) exceeds soft cap of ${MAX_ENTRIES_WARN}. Consider running memory_prune_candidates.`
         : null;
 
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation, warning }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: result.operation, revision: result.revision, warning }, null, 2) }] };
     }
   );
 
@@ -418,10 +553,13 @@ function buildMcpServer() {
       if (!existing || !existing.title) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
-      await pushVersion(id, existing, 'deleted');
+      // The counter is a separate key, so it survives the DEL below. That is what
+      // stops a stale if_version from matching a later re-created entry.
+      const revision = await redis.incr(`memrev:${id}`);
+      await pushVersion(id, existing, 'deleted', revision);
       await removeFromIndexes(id, existing);
       await redis.del(`mem:${id}`);
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted' }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted', revision }, null, 2) }] };
     }
   );
 
@@ -475,12 +613,16 @@ function buildMcpServer() {
         tags: tags.join(','),
       };
 
+      // Bumped only here, after the version has been found and parsed, so a
+      // failed rollback does not move the revision.
+      const revision = await redis.incr(`memrev:${id}`);
+
       await redis.hset(`mem:${id}`, fields);
       await addToIndexes(id, fields.type, fields.project, tags);
-      await pushVersion(id, { ...fields }, `rollback_to_${version_index}`);
+      await pushVersion(id, { ...fields }, `rollback_to_${version_index}`, revision);
       metricWriteTotal.inc();
 
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: `rollback_to_${version_index}`, restored_from: version.updated || 'unknown' }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: `rollback_to_${version_index}`, restored_from: version.updated || 'unknown', revision }, null, 2) }] };
     }
   );
 

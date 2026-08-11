@@ -1,6 +1,6 @@
 {
   "name": "memory-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Valkey-backed MCP memory server for AI agents — persistent, searchable, versioned cross-session memory",
   "type": "module",
   "main": "server.js",

@@ -118,6 +118,7 @@ Copy `.env.example` to `.env` and edit as needed.
 | `MEMORY_MCP_AUTH_TOKEN` | _(empty)_ | Bearer token for `/mcp`. Empty = no auth. Generate: `openssl rand -hex 32` |
 | `MEMORY_MCP_MAX_ENTRIES_WARN` | `300` | Soft cap — warns on write when exceeded |
 | `MEMORY_MCP_MAX_VERSIONS_PER_ENTRY` | `20` | Max version snapshots per entry |
+| `MEMORY_MCP_OPERATION_ID_TTL_SECONDS` | `604800` | How long an `operation_id` stays recorded for idempotent retries (7 days) |
 | `MEMORY_MCP_MEM_LIMIT` | `256m` | Container memory cap |
 | `VALKEY_IMAGE` | `valkey/valkey:9.0.3` | Valkey image to use |
 
@@ -151,12 +152,70 @@ Authorization: Bearer <token>
 |------|-------------|
 | `memory_search` | Search by tags (intersection), type, project, or text substring |
 | `memory_get` | Fetch one entry by ID (increments hit counter) |
-| `memory_set` | Create or update an entry (versioned on every write) |
+| `memory_set` | Create or update an entry (versioned on every write, optional compare-and-set) |
 | `memory_list` | List entries with optional type/project filter |
 | `memory_delete` | Delete an entry (tombstone version written first) |
 | `memory_history` | View version history for an entry |
 | `memory_rollback` | Restore an entry to a previous version |
 | `memory_prune_candidates` | Surface zero-hit stale entries for review (read-only) |
+
+## Concurrent writes
+
+By default `memory_set` is an unconditional full replacement: the last writer wins, and a
+write that lands between another client's read and its own write is silently overwritten.
+Two optional parameters make coordinated writes safe. Both default to off, so existing
+callers are unaffected.
+
+### `if_version` (compare-and-set)
+
+Every entry carries a monotonic `revision`, returned by `memory_get`. Pass it back as
+`if_version` and the write applies only if the revision still matches:
+
+```
+memory_get(id="my-entry")                     -> { ..., "revision": 7 }
+memory_set(id="my-entry", ..., if_version=7)  -> { "ok": true, "revision": 8 }
+```
+
+If another writer got there first you get a structured conflict rather than an error, and
+nothing is written:
+
+```json
+{ "ok": false, "error": "conflict", "id": "my-entry", "current_revision": 9, "expected_version": 7 }
+```
+
+On conflict, **re-read the entry and recompose your change against the new body**, then
+retry with the revision the conflict reported. Replaying the same body against the new
+revision would reintroduce the lost update this exists to prevent.
+
+`if_version=0` means "create if absent". It also succeeds once against an entry written by
+a server older than 1.1.0, which is how those entries get their first revision.
+
+The revision moves only on a real mutation: an applied `memory_set`, a `memory_rollback`, or
+a `memory_delete`. `memory_get` increments the hit counter without moving the revision, so
+reads never invalidate an outstanding compare-and-set.
+
+The revision counter outlives the entry it belongs to. After a delete, a re-created entry
+continues the sequence instead of restarting at 1, so a stale `if_version` from before the
+delete cannot match. One consequence: `if_version=0` against a deleted id returns a conflict
+carrying the current revision rather than creating. Retry with that revision.
+
+### `operation_id` (idempotent retries)
+
+A client that crashes after a successful write but before recording that fact cannot tell
+"not applied" from "applied, unacknowledged". Pass a unique `operation_id` and the retry is
+a true no-op that returns the original outcome:
+
+```json
+{ "ok": true, "id": "my-entry", "operation": "modified", "revision": 8, "replayed": true }
+```
+
+The replay check runs ahead of the `if_version` check, so a verbatim retry carrying a
+now-stale `if_version` still replays rather than conflicting. Records are kept for
+`MEMORY_MCP_OPERATION_ID_TTL_SECONDS` (7 days by default) and are scoped server-wide, not
+per entry.
+
+Conflicts are counted separately from writes in the metrics: `memory_conflict_total` rather
+than `memory_write_total`.
 
 ## Memory types
 
@@ -187,7 +246,15 @@ Each entry is stored as a Redis hash at `mem:<id>`:
 | `hits` | Times retrieved via `memory_get` |
 | `ttl` | Expiry in seconds (optional) |
 
-Version history is stored in a Redis list at `memver:<id>` (newest-first, capped at `MAX_VERSIONS_PER_ENTRY`).
+Version history is stored in a Redis list at `memver:<id>` (newest-first, capped at
+`MAX_VERSIONS_PER_ENTRY`). Each snapshot records the `rev` it was written at.
+
+The revision counter is a separate string key, `memrev:<id>`. It is deliberately not a field
+on the entry hash: it has to survive `memory_delete`, which deletes that hash. It is
+incremented only on semantic mutation, never by `memory_get`.
+
+Recorded `operation_id` values are hashes at `memop:<operation_id>` holding `memory_id`,
+`revision` and `action`, expiring after `MEMORY_MCP_OPERATION_ID_TTL_SECONDS`.
 
 Tag, type, and project indexes are Redis sets (`tag:<name>`, `type:<name>`, `project:<name>`).
 

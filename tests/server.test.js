@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import Redis from 'ioredis';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, '..', 'server.js');
@@ -56,6 +57,19 @@ async function call(c, name, args = {}) {
 
 function uid() {
   return 'test-' + Math.random().toString(36).slice(2);
+}
+
+// Direct Valkey access, for asserting raw keys the MCP API does not expose.
+function rawClient() {
+  return new Redis(VALKEY_URL, { lazyConnect: false });
+}
+
+// Scrape a single unlabelled counter/gauge value from /metrics.
+async function metric(base, name) {
+  const res = await fetch(`${base}/metrics`);
+  const text = await res.text();
+  const line = text.split('\n').find((l) => l.startsWith(`${name} `));
+  return line ? parseFloat(line.split(' ')[1]) : 0;
 }
 
 // ============================================================================
@@ -449,6 +463,637 @@ describe('memory-mcp server', () => {
     expect(after.body).toBe('original body');
 
     await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // revision counter
+  // --------------------------------------------------------------------------
+
+  it('memory_set starts revision at 1 and increments once per write', async () => {
+    const c = await client();
+    const id = uid();
+
+    const created = await call(c, 'memory_set', {
+      id, title: 'Rev 1', body: 'b', type: 'pattern',
+      tags: ['rev-test'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(created.ok).toBe(true);
+    expect(created.revision).toBe(1);
+
+    const modified = await call(c, 'memory_set', {
+      id, title: 'Rev 2', body: 'b', type: 'pattern',
+      tags: ['rev-test'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(modified.ok).toBe(true);
+    expect(modified.revision).toBe(2);
+
+    await c.close();
+  });
+
+  it('memory_get returns revision and does not move it despite counting hits', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Get rev', body: 'b', type: 'pattern',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const first = await call(c, 'memory_get', { id });
+    expect(first.revision).toBe(1);
+    expect(first.hits).toBe(1);
+
+    const second = await call(c, 'memory_get', { id });
+    expect(second.revision).toBe(1);
+    expect(second.hits).toBe(2);
+
+    await c.close();
+  });
+
+  it('version snapshots record the revision they were written at', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Snap 1', body: 'b1', type: 'pattern',
+      tags: ['snap'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await call(c, 'memory_set', {
+      id, title: 'Snap 2', body: 'b2', type: 'pattern',
+      tags: ['snap'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const history = await call(c, 'memory_history', { id });
+    await c.close();
+
+    expect(history.versions[0].rev).toBe(2);
+    expect(history.versions[1].rev).toBe(1);
+  });
+
+  it('memory_set preserves created date, tags array and index membership across updates', async () => {
+    const c = await client();
+    const id = uid();
+    const oldTag = uid();
+    const newTag = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Indexed', body: 'b', type: 'pattern',
+      tags: [oldTag], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    const before = await call(c, 'memory_get', { id });
+
+    await call(c, 'memory_set', {
+      id, title: 'Reindexed', body: 'b', type: 'decision',
+      tags: [newTag], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    const after = await call(c, 'memory_get', { id });
+
+    // created date carries over, tags round-trip as an array
+    expect(after.created).toBe(before.created);
+    expect(after.tags).toEqual([newTag]);
+
+    // old tag index no longer points at the entry, new one does
+    const oldSearch = await call(c, 'memory_search', { tags: [oldTag] });
+    expect(oldSearch.results.map((r) => r.id)).not.toContain(id);
+    const newSearch = await call(c, 'memory_search', { tags: [newTag] });
+    expect(newSearch.results.map((r) => r.id)).toContain(id);
+
+    await c.close();
+  });
+
+  it('memory_set with a ttl sets an expiry, and a later write without one clears it', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Expiring', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test', ttl: 600,
+    });
+    expect(await raw.ttl(`mem:${id}`)).toBeGreaterThan(0);
+
+    await call(c, 'memory_set', {
+      id, title: 'Permanent', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(await raw.ttl(`mem:${id}`)).toBe(-1);
+
+    await raw.quit();
+    await c.close();
+  });
+
+  it('an entry with no tags round-trips as an empty array, not an object', async () => {
+    // Regression guard. The version snapshot's tags array is encoded in JS and
+    // passed into the Lua script pre-encoded, because cjson encodes an empty Lua
+    // table as {} rather than []. Encoding it inside the script would silently
+    // turn a tagless entry's history into an object.
+    const c = await client();
+    const id = uid();
+
+    const created = await call(c, 'memory_set', {
+      id, title: 'No tags', body: 'b', type: 'pattern',
+      tags: [], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    expect(created.ok).toBe(true);
+
+    const got = await call(c, 'memory_get', { id });
+    expect(Array.isArray(got.tags)).toBe(true);
+    expect(got.tags).toEqual([]);
+
+    const history = await call(c, 'memory_history', { id });
+    expect(Array.isArray(history.versions[0].tags)).toBe(true);
+    expect(history.versions[0].tags).toEqual([]);
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // if_version
+  // --------------------------------------------------------------------------
+
+  it('if_version applies the write when it matches the current revision', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'v1', body: 'b1', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const result = await call(c, 'memory_set', {
+      id, title: 'v2', body: 'b2', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.revision).toBe(2);
+
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('b2');
+
+    await c.close();
+  });
+
+  it('if_version returns a conflict and writes nothing when it does not match', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'v1', body: 'original', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const result = await call(c, 'memory_set', {
+      id, title: 'stale', body: 'should not land', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 99,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('conflict');
+    expect(result.id).toBe(id);
+    expect(result.current_revision).toBe(1);
+    expect(result.expected_version).toBe(99);
+
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('original');
+    expect(after.revision).toBe(1);
+
+    await c.close();
+  });
+
+  it('if_version 0 creates when absent and conflicts when already versioned', async () => {
+    const c = await client();
+    const id = uid();
+
+    const created = await call(c, 'memory_set', {
+      id, title: 'fresh', body: 'b', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(created.ok).toBe(true);
+    expect(created.operation).toBe('created');
+    expect(created.revision).toBe(1);
+
+    const again = await call(c, 'memory_set', {
+      id, title: 'duplicate', body: 'b', type: 'pattern',
+      tags: ['cas'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(again.ok).toBe(false);
+    expect(again.error).toBe('conflict');
+    expect(again.current_revision).toBe(1);
+
+    await c.close();
+  });
+
+  it('if_version 0 upgrades a legacy entry that has no revision counter', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    // Seed an entry the way a pre-1.1.0 server would have: hash only, no memrev key.
+    await raw.hset(`mem:${id}`, {
+      title: 'Legacy entry',
+      body: 'written by an older server',
+      type: 'reference',
+      tags: 'legacy',
+      source: 'test-suite',
+      project: 'memory-mcp-test',
+      created: '2026-01-01',
+      updated: '2026-01-01',
+      hits: '7',
+    });
+    expect(await raw.exists(`memrev:${id}`)).toBe(0);
+
+    const upgraded = await call(c, 'memory_set', {
+      id, title: 'Upgraded', body: 'now versioned', type: 'reference',
+      tags: ['legacy'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(upgraded.ok).toBe(true);
+    expect(upgraded.operation).toBe('modified');
+    expect(upgraded.revision).toBe(1);
+
+    // A second if_version 0 now conflicts: the entry is versioned.
+    const second = await call(c, 'memory_set', {
+      id, title: 'again', body: 'b', type: 'reference',
+      tags: ['legacy'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(second.ok).toBe(false);
+    expect(second.error).toBe('conflict');
+
+    await raw.quit();
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // operation_id
+  // --------------------------------------------------------------------------
+
+  it('replaying an operation_id returns the prior result and writes nothing', async () => {
+    const c = await client();
+    const id = uid();
+    const opId = 'op-' + uid();
+
+    const first = await call(c, 'memory_set', {
+      id, title: 'once', body: 'first body', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(first.ok).toBe(true);
+    expect(first.revision).toBe(1);
+    expect(first.replayed).toBeUndefined();
+
+    // Same operation_id, different content: must be a no-op returning the first outcome.
+    const replay = await call(c, 'memory_set', {
+      id, title: 'twice', body: 'second body', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(replay.ok).toBe(true);
+    expect(replay.replayed).toBe(true);
+    expect(replay.revision).toBe(1);
+    expect(replay.operation).toBe('created');
+
+    // Nothing moved: body unchanged, revision unchanged, no second version.
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('first body');
+    expect(after.revision).toBe(1);
+
+    const history = await call(c, 'memory_history', { id });
+    expect(history.count).toBe(1);
+
+    await c.close();
+  });
+
+  it('a replay wins over a stale if_version rather than conflicting', async () => {
+    const c = await client();
+    const id = uid();
+    const opId = 'op-' + uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'v1', body: 'b', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    // A conditional write that succeeds, carrying an operation_id.
+    const applied = await call(c, 'memory_set', {
+      id, title: 'v2', body: 'b2', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1, operation_id: opId,
+    });
+    expect(applied.ok).toBe(true);
+    expect(applied.revision).toBe(2);
+
+    // The client never saw the ack and retries verbatim. if_version 1 is now
+    // stale, but the recorded operation_id must short-circuit ahead of the CAS.
+    const retry = await call(c, 'memory_set', {
+      id, title: 'v2', body: 'b2', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1, operation_id: opId,
+    });
+    expect(retry.ok).toBe(true);
+    expect(retry.replayed).toBe(true);
+    expect(retry.revision).toBe(2);
+
+    await c.close();
+  });
+
+  it('operation_id records expire after the retention window', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+    const opId = 'op-' + uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'ttl check', body: 'b', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+
+    const ttl = await raw.ttl(`memop:${opId}`);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(7 * 24 * 60 * 60);
+
+    const recorded = await raw.hgetall(`memop:${opId}`);
+    expect(recorded.memory_id).toBe(id);
+    expect(recorded.revision).toBe('1');
+    expect(recorded.action).toBe('created');
+
+    await raw.quit();
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // revision movement on delete and rollback
+  // --------------------------------------------------------------------------
+
+  it('memory_rollback moves the revision', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Original', body: 'original body', type: 'pattern',
+      tags: ['rb-rev'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await call(c, 'memory_set', {
+      id, title: 'Modified', body: 'modified body', type: 'pattern',
+      tags: ['rb-rev'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const rollback = await call(c, 'memory_rollback', { id, version_index: 1 });
+    expect(rollback.ok).toBe(true);
+    expect(rollback.revision).toBe(3);
+
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('original body');
+    expect(after.revision).toBe(3);
+
+    await c.close();
+  });
+
+  it('memory_delete moves the revision and the tombstone carries it', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Doomed', body: 'b', type: 'pattern',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const del = await call(c, 'memory_delete', { id });
+    expect(del.ok).toBe(true);
+    expect(del.revision).toBe(2);
+
+    const history = await call(c, 'memory_history', { id });
+    expect(history.versions[0].operation).toBe('deleted');
+    expect(history.versions[0].rev).toBe(2);
+
+    await c.close();
+  });
+
+  it('delete then re-create continues the revision sequence and rejects a stale if_version', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'First life', body: 'b', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    // A client reads revision 1 and holds it.
+    const held = await call(c, 'memory_get', { id });
+    expect(held.revision).toBe(1);
+
+    await call(c, 'memory_delete', { id });
+
+    // The stale expectation must not win: delete moved the revision to 2.
+    const stale = await call(c, 'memory_set', {
+      id, title: 'Resurrected by a stale writer', body: 'b', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1,
+    });
+    expect(stale.ok).toBe(false);
+    expect(stale.error).toBe('conflict');
+    expect(stale.current_revision).toBe(2);
+
+    // if_version 0 is also stale after a delete: the counter outlives the entry.
+    const asNew = await call(c, 'memory_set', {
+      id, title: 'Assumed new', body: 'b', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(asNew.ok).toBe(false);
+    expect(asNew.error).toBe('conflict');
+    expect(asNew.current_revision).toBe(2);
+
+    // Retrying with the revision the conflict reported succeeds, and the
+    // sequence continues rather than restarting at 1.
+    const recreated = await call(c, 'memory_set', {
+      id, title: 'Second life', body: 'b2', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 2,
+    });
+    expect(recreated.ok).toBe(true);
+    expect(recreated.operation).toBe('created');
+    expect(recreated.revision).toBe(3);
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // conflict isolation
+  // --------------------------------------------------------------------------
+
+  it('a conflict touches nothing and is counted as a conflict, not a write', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+    const tag = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Untouchable', body: 'original', type: 'pattern',
+      tags: [tag], source: 'test-suite', project: 'memory-mcp-test', ttl: 600,
+    });
+    await call(c, 'memory_get', { id }); // hits -> 1
+
+    const before = {
+      hash: await raw.hgetall(`mem:${id}`),
+      versions: await raw.lrange(`memver:${id}`, 0, -1),
+      tagMembers: await raw.smembers(`tag:${tag}`),
+      typeMembers: await raw.smembers('type:pattern'),
+      rev: await raw.get(`memrev:${id}`),
+      ttl: await raw.ttl(`mem:${id}`),
+      writes: await metric(BASE, 'memory_write_total'),
+      conflicts: await metric(BASE, 'memory_conflict_total'),
+    };
+
+    const conflict = await call(c, 'memory_set', {
+      id, title: 'Rejected', body: 'must not land', type: 'decision',
+      tags: [uid()], source: 'test-suite', project: 'other-project',
+      if_version: 42,
+    });
+    expect(conflict.ok).toBe(false);
+    expect(conflict.error).toBe('conflict');
+
+    const after = {
+      hash: await raw.hgetall(`mem:${id}`),
+      versions: await raw.lrange(`memver:${id}`, 0, -1),
+      tagMembers: await raw.smembers(`tag:${tag}`),
+      typeMembers: await raw.smembers('type:pattern'),
+      rev: await raw.get(`memrev:${id}`),
+      ttl: await raw.ttl(`mem:${id}`),
+      writes: await metric(BASE, 'memory_write_total'),
+      conflicts: await metric(BASE, 'memory_conflict_total'),
+    };
+
+    // No hash field moved, including hits.
+    expect(after.hash).toEqual(before.hash);
+    // No version pushed.
+    expect(after.versions).toEqual(before.versions);
+    // No index set touched.
+    expect(after.tagMembers.sort()).toEqual(before.tagMembers.sort());
+    expect(after.typeMembers.sort()).toEqual(before.typeMembers.sort());
+    // Revision did not move.
+    expect(after.rev).toBe(before.rev);
+    // TTL was not refreshed or cleared.
+    expect(after.ttl).toBeLessThanOrEqual(before.ttl);
+    expect(after.ttl).toBeGreaterThan(0);
+    // Counted as a conflict, not a write.
+    expect(after.writes).toBe(before.writes);
+    expect(after.conflicts).toBe(before.conflicts + 1);
+
+    await raw.quit();
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // concurrency
+  // --------------------------------------------------------------------------
+
+  it('N concurrent writers holding the same revision produce exactly one winner', async () => {
+    const setup = await client();
+    const id = uid();
+    await call(setup, 'memory_set', {
+      id, title: 'Contended', body: 'base', type: 'pattern',
+      tags: ['race'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await setup.close();
+
+    const WRITERS = 8;
+    const clients = await Promise.all(
+      Array.from({ length: WRITERS }, () => client())
+    );
+
+    const results = await Promise.all(
+      clients.map((c, i) => call(c, 'memory_set', {
+        id, title: `writer-${i}`, body: `body-${i}`, type: 'pattern',
+        tags: ['race'], source: 'test-suite', project: 'memory-mcp-test',
+        if_version: 1,
+      }))
+    );
+
+    await Promise.all(clients.map((c) => c.close()));
+
+    const winners = results.filter((r) => r.ok === true);
+    const losers = results.filter((r) => r.ok === false);
+
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(WRITERS - 1);
+    expect(winners[0].revision).toBe(2);
+    losers.forEach((l) => {
+      expect(l.error).toBe('conflict');
+      expect(l.expected_version).toBe(1);
+      expect(l.current_revision).toBe(2);
+    });
+
+    // The stored entry is exactly one writer's, with no interleaved fields.
+    const verify = await client();
+    const final = await call(verify, 'memory_get', { id });
+    await verify.close();
+
+    expect(final.revision).toBe(2);
+    // The stored title and body must come from the same writer. If the fields
+    // interleaved, title would name one writer and body another.
+    expect(final.title).toMatch(/^writer-\d+$/);
+    const writerIndex = final.title.replace('writer-', '');
+    expect(final.body).toBe(`body-${writerIndex}`);
+  });
+
+  it('concurrent unconditional writers leave no interleaved index state', async () => {
+    // The previous test passes even if the requests happen to serialise. This one
+    // does not: it targets the read-then-reindex sequence that the old pipeline
+    // performed non-atomically. Each writer swaps the entry onto its own tag, so
+    // afterwards exactly one tag set may contain the entry. A non-atomic path can
+    // interleave an SREM of one writer's tag with another's SADD and strand the
+    // entry in several tag sets at once.
+    const WRITERS = 10;
+    const id = uid();
+    const tags = Array.from({ length: WRITERS }, () => uid());
+
+    const setup = await client();
+    await call(setup, 'memory_set', {
+      id, title: 'Reindexed concurrently', body: 'base', type: 'pattern',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await setup.close();
+
+    const clients = await Promise.all(
+      Array.from({ length: WRITERS }, () => client())
+    );
+
+    const results = await Promise.all(
+      clients.map((c, i) => call(c, 'memory_set', {
+        id, title: `writer-${i}`, body: `body-${i}`, type: 'pattern',
+        tags: [tags[i]], source: 'test-suite', project: 'memory-mcp-test',
+      }))
+    );
+    await Promise.all(clients.map((c) => c.close()));
+
+    // Every write applied, and each got its own revision: no two writers can
+    // observe the same counter value.
+    results.forEach((r) => expect(r.ok).toBe(true));
+    const revisions = results.map((r) => r.revision).sort((a, b) => a - b);
+    expect(new Set(revisions).size).toBe(WRITERS);
+    expect(revisions).toEqual(Array.from({ length: WRITERS }, (_, i) => i + 2));
+
+    // Exactly one tag set still points at the entry.
+    const raw = rawClient();
+    const memberships = [];
+    for (const tag of tags) {
+      if (await raw.sismember(`tag:${tag}`, `mem:${id}`)) memberships.push(tag);
+    }
+    await raw.quit();
+
+    expect(memberships).toHaveLength(1);
+
+    // And it is the tag belonging to whichever writer landed last.
+    const verify = await client();
+    const final = await call(verify, 'memory_get', { id });
+    await verify.close();
+
+    expect(final.tags).toEqual(memberships);
+    expect(final.revision).toBe(WRITERS + 1);
   });
 });
 
