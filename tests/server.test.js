@@ -799,6 +799,102 @@ describe('memory-mcp server', () => {
     await raw.quit();
     await c.close();
   });
+
+  // --------------------------------------------------------------------------
+  // revision movement on delete and rollback
+  // --------------------------------------------------------------------------
+
+  it('memory_rollback moves the revision', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Original', body: 'original body', type: 'pattern',
+      tags: ['rb-rev'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await call(c, 'memory_set', {
+      id, title: 'Modified', body: 'modified body', type: 'pattern',
+      tags: ['rb-rev'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const rollback = await call(c, 'memory_rollback', { id, version_index: 1 });
+    expect(rollback.ok).toBe(true);
+    expect(rollback.revision).toBe(3);
+
+    const after = await call(c, 'memory_get', { id });
+    expect(after.body).toBe('original body');
+    expect(after.revision).toBe(3);
+
+    await c.close();
+  });
+
+  it('memory_delete moves the revision and the tombstone carries it', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Doomed', body: 'b', type: 'pattern',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    const del = await call(c, 'memory_delete', { id });
+    expect(del.ok).toBe(true);
+    expect(del.revision).toBe(2);
+
+    const history = await call(c, 'memory_history', { id });
+    expect(history.versions[0].operation).toBe('deleted');
+    expect(history.versions[0].rev).toBe(2);
+
+    await c.close();
+  });
+
+  it('delete then re-create continues the revision sequence and rejects a stale if_version', async () => {
+    const c = await client();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'First life', body: 'b', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    // A client reads revision 1 and holds it.
+    const held = await call(c, 'memory_get', { id });
+    expect(held.revision).toBe(1);
+
+    await call(c, 'memory_delete', { id });
+
+    // The stale expectation must not win: delete moved the revision to 2.
+    const stale = await call(c, 'memory_set', {
+      id, title: 'Resurrected by a stale writer', body: 'b', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 1,
+    });
+    expect(stale.ok).toBe(false);
+    expect(stale.error).toBe('conflict');
+    expect(stale.current_revision).toBe(2);
+
+    // if_version 0 is also stale after a delete: the counter outlives the entry.
+    const asNew = await call(c, 'memory_set', {
+      id, title: 'Assumed new', body: 'b', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(asNew.ok).toBe(false);
+    expect(asNew.error).toBe('conflict');
+    expect(asNew.current_revision).toBe(2);
+
+    // Retrying with the revision the conflict reported succeeds, and the
+    // sequence continues rather than restarting at 1.
+    const recreated = await call(c, 'memory_set', {
+      id, title: 'Second life', body: 'b2', type: 'pattern',
+      tags: ['aba'], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 2,
+    });
+    expect(recreated.ok).toBe(true);
+    expect(recreated.operation).toBe('created');
+    expect(recreated.revision).toBe(3);
+
+    await c.close();
+  });
 });
 
 // ============================================================================

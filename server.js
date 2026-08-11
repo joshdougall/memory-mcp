@@ -553,10 +553,13 @@ function buildMcpServer() {
       if (!existing || !existing.title) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
-      await pushVersion(id, existing, 'deleted');
+      // The counter is a separate key, so it survives the DEL below. That is what
+      // stops a stale if_version from matching a later re-created entry.
+      const revision = await redis.incr(`memrev:${id}`);
+      await pushVersion(id, existing, 'deleted', revision);
       await removeFromIndexes(id, existing);
       await redis.del(`mem:${id}`);
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted' }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted', revision }, null, 2) }] };
     }
   );
 
@@ -610,12 +613,16 @@ function buildMcpServer() {
         tags: tags.join(','),
       };
 
+      // Bumped only here, after the version has been found and parsed, so a
+      // failed rollback does not move the revision.
+      const revision = await redis.incr(`memrev:${id}`);
+
       await redis.hset(`mem:${id}`, fields);
       await addToIndexes(id, fields.type, fields.project, tags);
-      await pushVersion(id, { ...fields }, `rollback_to_${version_index}`);
+      await pushVersion(id, { ...fields }, `rollback_to_${version_index}`, revision);
       metricWriteTotal.inc();
 
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: `rollback_to_${version_index}`, restored_from: version.updated || 'unknown' }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: `rollback_to_${version_index}`, restored_from: version.updated || 'unknown', revision }, null, 2) }] };
     }
   );
 
