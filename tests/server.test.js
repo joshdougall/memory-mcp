@@ -1319,6 +1319,127 @@ describe('memory-mcp server', () => {
 
     await raw.quit();
   });
+
+  // --------------------------------------------------------------------------
+  // tag validation
+  // --------------------------------------------------------------------------
+
+  it('memory_set rejects a tag containing a comma', async () => {
+    const c = await client();
+    const id = uid();
+
+    const outcome = await c.callTool({
+      name: 'memory_set',
+      arguments: {
+        id, title: 'comma tag', body: 'b', type: 'pattern',
+        tags: ['foo,bar'], source: 'test-suite', project: 'memory-mcp-test',
+      },
+    }).then((r) => r, (e) => e);
+
+    // Whether surfaced as a protocol error or an isError result, the write
+    // must be refused: the CSV wire format cannot represent a comma tag.
+    if (!(outcome instanceof Error)) expect(outcome.isError).toBe(true);
+    const gone = await call(c, 'memory_get', { id });
+    expect(gone.error).toMatch(/Not found/);
+
+    await c.close();
+  });
+
+  it('memory_set rejects an empty-string tag', async () => {
+    const c = await client();
+    const id = uid();
+
+    const outcome = await c.callTool({
+      name: 'memory_set',
+      arguments: {
+        id, title: 'empty tag', body: 'b', type: 'pattern',
+        tags: ['', 'real-tag'], source: 'test-suite', project: 'memory-mcp-test',
+      },
+    }).then((r) => r, (e) => e);
+
+    if (!(outcome instanceof Error)) expect(outcome.isError).toBe(true);
+    const gone = await call(c, 'memory_get', { id });
+    expect(gone.error).toMatch(/Not found/);
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // memory_get error surfacing
+  // --------------------------------------------------------------------------
+
+  it('memory_get surfaces a storage error instead of fabricating a success', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Corruptible', body: 'b', type: 'pattern',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    // Sabotage the hit counter so the pipelined HINCRBY fails.
+    await raw.hset(`mem:${id}`, 'hits', 'not-a-number');
+
+    const outcome = await c.callTool({
+      name: 'memory_get',
+      arguments: { id },
+    }).then((r) => r, (e) => e);
+
+    if (!(outcome instanceof Error)) expect(outcome.isError).toBe(true);
+
+    await raw.quit();
+    await c.close();
+  });
+});
+
+// ============================================================================
+// CONFIGURED SERVER TESTS (port 3109, MAX_ENTRIES_WARN=0, OPERATION_ID_TTL_SECONDS=3600)
+// ============================================================================
+
+describe('memory-mcp configured retention and soft cap', () => {
+  let proc;
+  const BASE = 'http://127.0.0.1:3109';
+
+  beforeAll(async () => {
+    proc = spawnServer(3109, { MAX_ENTRIES_WARN: '0', OPERATION_ID_TTL_SECONDS: '3600' });
+    await waitReady(BASE);
+  });
+
+  afterAll(async () => {
+    proc.kill('SIGTERM');
+    await new Promise((r) => proc.on('exit', r));
+  });
+
+  it('the operation_id description reflects the configured retention window', async () => {
+    const c = await client(3109);
+    const tools = await c.listTools();
+    const memSet = tools.tools.find((t) => t.name === 'memory_set');
+    expect(memSet.inputSchema.properties.operation_id.description).toContain('3600 seconds');
+    await c.close();
+  });
+
+  it('a replayed write still carries the soft-cap warning', async () => {
+    const c = await client(3109);
+    const id = uid();
+    const opId = 'op-' + uid();
+
+    const first = await call(c, 'memory_set', {
+      id, title: 'warned', body: 'b', type: 'pattern',
+      tags: ['warn'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(first.warning).toMatch(/soft cap/);
+
+    const replay = await call(c, 'memory_set', {
+      id, title: 'warned', body: 'b', type: 'pattern',
+      tags: ['warn'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.warning).toMatch(/soft cap/);
+
+    await c.close();
+  });
 });
 
 // ============================================================================

@@ -388,7 +388,7 @@ redis.defineCommand('memoryDeleteAtomic', { numberOfKeys: 3, lua: LUA_COMMON + M
 function buildMcpServer() {
   const server = new McpServer({
     name: 'memory-mcp',
-    version: '1.1.0',
+    version: '1.1.1',
   });
 
   server.tool(
