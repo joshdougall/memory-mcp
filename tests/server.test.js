@@ -1095,6 +1095,230 @@ describe('memory-mcp server', () => {
     expect(final.tags).toEqual(memberships);
     expect(final.revision).toBe(WRITERS + 1);
   });
+
+  // --------------------------------------------------------------------------
+  // lifecycle: memrev/memver share a TTL entry's lifetime
+  // --------------------------------------------------------------------------
+
+  it('a TTL entry expires together with its revision counter and history', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Ephemeral', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test', ttl: 1,
+    });
+    expect(await raw.ttl(`memrev:${id}`)).toBeGreaterThan(0);
+    expect(await raw.ttl(`memver:${id}`)).toBeGreaterThan(0);
+
+    await new Promise((r) => setTimeout(r, 1400));
+    expect(await raw.exists(`mem:${id}`, `memrev:${id}`, `memver:${id}`)).toBe(0);
+
+    // With the counter gone, create-if-absent works again as documented.
+    const recreated = await call(c, 'memory_set', {
+      id, title: 'Fresh start', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+      if_version: 0,
+    });
+    expect(recreated.ok).toBe(true);
+    expect(recreated.operation).toBe('created');
+    expect(recreated.revision).toBe(1);
+
+    await raw.quit();
+    await c.close();
+  });
+
+  it('removing a TTL persists the revision counter and history alongside the entry', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Expiring', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test', ttl: 600,
+    });
+    await call(c, 'memory_set', {
+      id, title: 'Permanent', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+    });
+
+    expect(await raw.ttl(`mem:${id}`)).toBe(-1);
+    expect(await raw.ttl(`memrev:${id}`)).toBe(-1);
+    expect(await raw.ttl(`memver:${id}`)).toBe(-1);
+
+    await raw.quit();
+    await c.close();
+  });
+
+  it('memory_delete persists a TTL entry\'s counter and tombstone history', async () => {
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Doomed but remembered', body: 'b', type: 'state',
+      tags: [uid()], source: 'test-suite', project: 'memory-mcp-test', ttl: 600,
+    });
+
+    const del = await call(c, 'memory_delete', { id });
+    expect(del.ok).toBe(true);
+
+    // The tombstone and the ABA counter must outlive the entry's old deadline.
+    expect(await raw.ttl(`memver:${id}`)).toBe(-1);
+    expect(await raw.ttl(`memrev:${id}`)).toBe(-1);
+    const tombstone = JSON.parse(await raw.lindex(`memver:${id}`, 0));
+    expect(tombstone.operation).toBe('deleted');
+
+    await raw.quit();
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // operation_id: reuse across different ids
+  // --------------------------------------------------------------------------
+
+  it('reusing an operation_id for a different id is an error, not a silent replay', async () => {
+    const c = await client();
+    const idA = uid();
+    const idB = uid();
+    const opId = 'op-' + uid();
+
+    const first = await call(c, 'memory_set', {
+      id: idA, title: 'first', body: 'b', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(first.ok).toBe(true);
+
+    const second = await call(c, 'memory_set', {
+      id: idB, title: 'second', body: 'b', type: 'pattern',
+      tags: ['idem'], source: 'test-suite', project: 'memory-mcp-test',
+      operation_id: opId,
+    });
+    expect(second.ok).toBe(false);
+    expect(second.error).toBe('operation_id_mismatch');
+    expect(second.recorded_id).toBe(idA);
+
+    // The mismatched write must not have landed anywhere.
+    const gone = await call(c, 'memory_get', { id: idB });
+    expect(gone.error).toMatch(/Not found/);
+
+    await c.close();
+  });
+
+  // --------------------------------------------------------------------------
+  // atomicity: delete and rollback against concurrent writers
+  // --------------------------------------------------------------------------
+
+  it('concurrent set and delete leave no stale index memberships', async () => {
+    const raw = rawClient();
+
+    for (let round = 0; round < 5; round++) {
+      const id = uid();
+      const WRITERS = 8;
+      const DELETERS = 3;
+      const tags = Array.from({ length: WRITERS }, () => uid());
+
+      const setup = await client();
+      await call(setup, 'memory_set', {
+        id, title: 'base', body: 'b', type: 'pattern',
+        tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+      });
+      await setup.close();
+
+      const clients = await Promise.all(
+        Array.from({ length: WRITERS + DELETERS }, () => client())
+      );
+      await Promise.all([
+        ...tags.map((tag, i) => call(clients[i], 'memory_set', {
+          id, title: `writer-${i}`, body: 'b', type: 'pattern',
+          tags: [tag], source: 'test-suite', project: 'memory-mcp-test',
+        })),
+        ...Array.from({ length: DELETERS }, (_, i) =>
+          call(clients[WRITERS + i], 'memory_delete', { id })),
+      ]);
+      await Promise.all(clients.map((c) => c.close()));
+
+      // Whatever the interleaving, index membership must match the final entry:
+      // alive means exactly its own tag, deleted means no memberships at all.
+      const alive = (await raw.exists(`mem:${id}`)) === 1;
+      const entryTags = alive
+        ? ((await raw.hget(`mem:${id}`, 'tags')) || '').split(',').filter(Boolean)
+        : [];
+      for (const tag of tags) {
+        const member = (await raw.sismember(`tag:${tag}`, `mem:${id}`)) === 1;
+        expect(member, `round ${round}: tag ${tag} membership=${member} alive=${alive}`).toBe(
+          alive && entryTags.includes(tag)
+        );
+      }
+    }
+
+    await raw.quit();
+  });
+
+  it('concurrent set and rollback keep history and indexes consistent', async () => {
+    const raw = rawClient();
+
+    for (let round = 0; round < 8; round++) {
+      const id = uid();
+      const WRITERS = 8;
+      const ROLLBACKERS = 6;
+      const tags = Array.from({ length: WRITERS }, () => uid());
+
+      const setup = await client();
+      await call(setup, 'memory_set', {
+        id, title: 'v1', body: 'b1', type: 'pattern',
+        tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+      });
+      await call(setup, 'memory_set', {
+        id, title: 'v2', body: 'b2', type: 'pattern',
+        tags: [uid()], source: 'test-suite', project: 'memory-mcp-test',
+      });
+      await setup.close();
+
+      const clients = await Promise.all(
+        Array.from({ length: WRITERS + ROLLBACKERS }, () => client())
+      );
+      // Interleave the dispatch order so writes and rollbacks overlap in flight.
+      const ops = [];
+      for (let i = 0; i < Math.max(WRITERS, ROLLBACKERS); i++) {
+        if (i < WRITERS) {
+          ops.push(call(clients[i], 'memory_set', {
+            id, title: `writer-${i}`, body: 'b', type: 'pattern',
+            tags: [tags[i]], source: 'test-suite', project: 'memory-mcp-test',
+          }));
+        }
+        if (i < ROLLBACKERS) {
+          ops.push(call(clients[WRITERS + i], 'memory_rollback', { id, version_index: 0 }));
+        }
+      }
+      await Promise.all(ops);
+      await Promise.all(clients.map((c) => c.close()));
+
+      // History must be written in revision order: every mutation is atomic, so
+      // no snapshot can be pushed beneath one with a higher revision.
+      const revs = (await raw.lrange(`memver:${id}`, 0, -1)).map((v) => JSON.parse(v).rev);
+      for (let i = 1; i < revs.length; i++) {
+        expect(revs[i], `round ${round}: history revs ${revs.join(',')}`).toBeLessThan(revs[i - 1]);
+      }
+
+      // Index membership matches the final entry state.
+      const entryTags = ((await raw.hget(`mem:${id}`, 'tags')) || '').split(',').filter(Boolean);
+      for (const tag of tags) {
+        const member = (await raw.sismember(`tag:${tag}`, `mem:${id}`)) === 1;
+        expect(member, `round ${round}: tag ${tag}`).toBe(entryTags.includes(tag));
+      }
+
+      // The served revision agrees with the counter.
+      const verify = await client();
+      const final = await call(verify, 'memory_get', { id });
+      await verify.close();
+      expect(final.revision).toBe(parseInt(await raw.get(`memrev:${id}`), 10));
+    }
+
+    await raw.quit();
+  });
 });
 
 // ============================================================================

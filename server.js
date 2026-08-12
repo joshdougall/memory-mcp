@@ -158,41 +158,11 @@ async function scanKeys(pattern) {
   return keys;
 }
 
-async function pushVersion(id, fields, operation, rev) {
-  const snapshot = JSON.stringify({
-    title: fields.title || '',
-    body: fields.body || '',
-    type: fields.type || '',
-    tags: fields.tags ? fields.tags.split(',').filter(Boolean) : [],
-    source: fields.source || 'unknown',
-    project: fields.project || '',
-    updated: nowIso(),
-    operation,
-    rev,
-  });
-  await redis.lpush(`memver:${id}`, snapshot);
-  await redis.ltrim(`memver:${id}`, 0, MAX_VERSIONS_PER_ENTRY - 1);
-}
-
-async function removeFromIndexes(id, fields) {
-  const pipeline = redis.pipeline();
-  if (fields.type) pipeline.srem(`type:${fields.type}`, `mem:${id}`);
-  pipeline.srem(`project:${fields.project || ''}`, `mem:${id}`);
-  const tags = fields.tags ? fields.tags.split(',').filter(Boolean) : [];
-  for (const tag of tags) {
-    pipeline.srem(`tag:${tag}`, `mem:${id}`);
-  }
-  await pipeline.exec();
-}
-
-async function addToIndexes(id, type, project, tags) {
-  const pipeline = redis.pipeline();
-  if (type) pipeline.sadd(`type:${type}`, `mem:${id}`);
-  pipeline.sadd(`project:${project}`, `mem:${id}`);
-  for (const tag of tags) {
-    if (tag) pipeline.sadd(`tag:${tag}`, `mem:${id}`);
-  }
-  await pipeline.exec();
+async function entryCountWarning() {
+  const totalKeys = await scanKeys('mem:*');
+  return totalKeys.length > MAX_ENTRIES_WARN
+    ? `Entry count (${totalKeys.length}) exceeds soft cap of ${MAX_ENTRIES_WARN}. Consider running memory_prune_candidates.`
+    : null;
 }
 
 function entryToObject(raw) {
@@ -211,21 +181,62 @@ function entryToObject(raw) {
 }
 
 // ============================================================================
-// LUA: ATOMIC memory_set
+// LUA: ATOMIC WRITE PATH
 // ============================================================================
 
 // A pipeline batches round trips but is not atomic, and a compare-and-set needs
 // to read the revision and conditionally abort in the same breath. EVAL is
 // atomic in Valkey, so the replay check, the revision check and the write either
-// all happen or none do.
+// all happen or none do. Every mutation (set, rollback, delete) goes through
+// one of these scripts; nothing outside them touches indexes or history.
 //
+// Index set names are derived inside the scripts rather than passed as keys.
+// This server already assumes a single (non-cluster) Valkey: memory_search
+// SINTERs across tag: keys that would hash to different slots.
+
+// Shared by every mutating script, so index maintenance and the snapshot wire
+// format exist in exactly one place.
+const LUA_COMMON = `
+local function splitCsv(csv)
+  local out = {}
+  for item in string.gmatch(csv or '', '([^,]+)') do out[#out + 1] = item end
+  return out
+end
+
+-- Encode a CSV tag list as a JSON array. Built by hand because cjson encodes
+-- an empty Lua table as {} rather than [].
+local function encodeTags(csv)
+  local parts = {}
+  for _, t in ipairs(splitCsv(csv)) do parts[#parts + 1] = cjson.encode(t) end
+  return '[' .. table.concat(parts, ',') .. ']'
+end
+
+local function remIndexes(memKey, mtype, project, tagsCsv)
+  if mtype and mtype ~= '' then redis.call('SREM', 'type:' .. mtype, memKey) end
+  redis.call('SREM', 'project:' .. (project or ''), memKey)
+  for _, t in ipairs(splitCsv(tagsCsv)) do redis.call('SREM', 'tag:' .. t, memKey) end
+end
+
+local function addIndexes(memKey, mtype, project, tagsCsv)
+  if mtype ~= '' then redis.call('SADD', 'type:' .. mtype, memKey) end
+  redis.call('SADD', 'project:' .. project, memKey)
+  for _, t in ipairs(splitCsv(tagsCsv)) do redis.call('SADD', 'tag:' .. t, memKey) end
+end
+
+local function pushSnapshot(verKey, maxVersions, title, body, mtype, tagsJson, source, project, now, operation, rev)
+  redis.call('LPUSH', verKey, string.format(
+    '{"title":%s,"body":%s,"type":%s,"tags":%s,"source":%s,"project":%s,"updated":%s,"operation":%s,"rev":%d}',
+    cjson.encode(title), cjson.encode(body), cjson.encode(mtype), tagsJson,
+    cjson.encode(source), cjson.encode(project), cjson.encode(now), cjson.encode(operation), rev))
+  redis.call('LTRIM', verKey, 0, maxVersions - 1)
+end
+`;
+
 // KEYS: 1 mem:<id>  2 memver:<id>  3 memrev:<id>  4 memop:<operation_id> ('' when unused)
 // ARGV: 1 id  2 title  3 body  4 type  5 tagsCsv  6 tagsJson  7 source
-//       8 project  9 now  10 ttl  11 maxVersions  12 ifVersion  13 hasOp  14 opTtl
-//
-// Index set names are derived inside the script rather than passed as keys. This
-// server already assumes a single (non-cluster) Valkey: memory_search SINTERs
-// across tag: keys that would hash to different slots.
+//       8 project  9 now  10 ttl ('KEEP' leaves the current expiry untouched)
+//       11 maxVersions  12 ifVersion  13 hasOp  14 opTtl
+//       15 opOverride ('' derives created/modified; rollback passes its label)
 const MEMORY_SET_LUA = `
 local memKey, verKey, revKey, opKey = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
 
@@ -243,17 +254,17 @@ local maxVersions = tonumber(ARGV[11])
 local ifVersion   = ARGV[12]
 local hasOp       = ARGV[13] == '1'
 local opTtl       = tonumber(ARGV[14])
+local opOverride  = ARGV[15]
 
-local function splitCsv(csv)
-  local out = {}
-  for item in string.gmatch(csv or '', '([^,]+)') do out[#out + 1] = item end
-  return out
-end
-
--- 1. Replay: an already recorded operation_id returns its outcome and writes nothing.
+-- 1. Replay: an already recorded operation_id returns its outcome and writes
+--    nothing. A record for a DIFFERENT id is a client bug (a reused key), and
+--    silently replaying it would drop this write, so it is rejected instead.
 if hasOp then
   local rec = redis.call('HMGET', opKey, 'memory_id', 'revision', 'action')
   if rec[1] then
+    if rec[1] ~= id then
+      return cjson.encode({ status = 'op_mismatch', recorded_id = rec[1] })
+    end
     return cjson.encode({
       status = 'replayed',
       id = rec[1],
@@ -280,15 +291,17 @@ local flat = redis.call('HGETALL', memKey)
 local prev = {}
 for i = 1, #flat, 2 do prev[flat[i]] = flat[i + 1] end
 local isNew = prev.title == nil
-local operation = isNew and 'created' or 'modified'
+local operation = opOverride ~= '' and opOverride or (isNew and 'created' or 'modified')
 
 if not isNew then
-  if prev.type and prev.type ~= '' then redis.call('SREM', 'type:' .. prev.type, memKey) end
-  redis.call('SREM', 'project:' .. (prev.project or ''), memKey)
-  for _, t in ipairs(splitCsv(prev.tags)) do redis.call('SREM', 'tag:' .. t, memKey) end
+  remIndexes(memKey, prev.type, prev.project, prev.tags)
 end
 
 local newRev = redis.call('INCR', revKey)
+
+-- 'KEEP' (rollback) records whatever ttl the live entry already had.
+local ttlField = ttl
+if ttl == 'KEEP' then ttlField = prev.ttl or '' end
 
 redis.call('HSET', memKey,
   'title', title,
@@ -298,27 +311,31 @@ redis.call('HSET', memKey,
   'project', project,
   'updated', now,
   'hits', isNew and '0' or (prev.hits or '0'),
-  'ttl', ttl,
+  'ttl', ttlField,
   'tags', tagsCsv,
   'created', isNew and now or (prev.created or now))
 
-if ttl ~= '' then
-  redis.call('EXPIRE', memKey, tonumber(ttl))
-elseif not isNew then
-  redis.call('PERSIST', memKey)
-end
-
-if mtype ~= '' then redis.call('SADD', 'type:' .. mtype, memKey) end
-redis.call('SADD', 'project:' .. project, memKey)
-for _, t in ipairs(splitCsv(tagsCsv)) do redis.call('SADD', 'tag:' .. t, memKey) end
+addIndexes(memKey, mtype, project, tagsCsv)
 
 -- tagsJson arrives pre-encoded from the caller: cjson encodes an empty Lua table
 -- as {} rather than [], which would corrupt the tags array in history.
-redis.call('LPUSH', verKey, string.format(
-  '{"title":%s,"body":%s,"type":%s,"tags":%s,"source":%s,"project":%s,"updated":%s,"operation":%s,"rev":%d}',
-  cjson.encode(title), cjson.encode(body), cjson.encode(mtype), tagsJson,
-  cjson.encode(source), cjson.encode(project), cjson.encode(now), cjson.encode(operation), newRev))
-redis.call('LTRIM', verKey, 0, maxVersions - 1)
+pushSnapshot(verKey, maxVersions, title, body, mtype, tagsJson, source, project, now, operation, newRev)
+
+-- The revision counter and history share the entry's lifetime: all three keys
+-- expire together, so a naturally expired id starts over as a clean slate.
+-- Applied after the snapshot push so a brand-new verKey exists to receive a
+-- TTL. 'KEEP' touches nothing: the lifetime follows the live entry's expiry.
+if ttl == 'KEEP' then
+  -- rollback: leave the current expiry, if any, in place
+elseif ttl ~= '' then
+  redis.call('EXPIRE', memKey, tonumber(ttl))
+  redis.call('EXPIRE', verKey, tonumber(ttl))
+  redis.call('EXPIRE', revKey, tonumber(ttl))
+else
+  redis.call('PERSIST', memKey)
+  redis.call('PERSIST', verKey)
+  redis.call('PERSIST', revKey)
+end
 
 if hasOp then
   redis.call('HSET', opKey, 'memory_id', id, 'revision', newRev, 'action', operation)
@@ -328,7 +345,41 @@ end
 return cjson.encode({ status = 'ok', id = id, revision = newRev, operation = operation })
 `;
 
-redis.defineCommand('memorySetAtomic', { numberOfKeys: 4, lua: MEMORY_SET_LUA });
+// KEYS: 1 mem:<id>  2 memver:<id>  3 memrev:<id>
+// ARGV: 1 now  2 maxVersions
+const MEMORY_DELETE_LUA = `
+local memKey, verKey, revKey = KEYS[1], KEYS[2], KEYS[3]
+
+local now         = ARGV[1]
+local maxVersions = tonumber(ARGV[2])
+
+local flat = redis.call('HGETALL', memKey)
+local prev = {}
+for i = 1, #flat, 2 do prev[flat[i]] = flat[i + 1] end
+if prev.title == nil then
+  return cjson.encode({ status = 'not_found' })
+end
+
+-- The counter is a separate key, so it survives the DEL below. That is what
+-- stops a stale if_version from matching a later re-created entry.
+local newRev = redis.call('INCR', revKey)
+
+pushSnapshot(verKey, maxVersions, prev.title, prev.body or '', prev.type or '',
+  encodeTags(prev.tags), prev.source or 'unknown', prev.project or '', now, 'deleted', newRev)
+
+-- Deletion is explicit: the tombstone and the ABA counter outlive any TTL the
+-- entry carried.
+redis.call('PERSIST', verKey)
+redis.call('PERSIST', revKey)
+
+remIndexes(memKey, prev.type, prev.project, prev.tags)
+redis.call('DEL', memKey)
+
+return cjson.encode({ status = 'ok', revision = newRev })
+`;
+
+redis.defineCommand('memorySetAtomic', { numberOfKeys: 4, lua: LUA_COMMON + MEMORY_SET_LUA });
+redis.defineCommand('memoryDeleteAtomic', { numberOfKeys: 3, lua: LUA_COMMON + MEMORY_DELETE_LUA });
 
 // ============================================================================
 // MCP SERVER
@@ -435,7 +486,13 @@ function buildMcpServer() {
         .hincrby(`mem:${id}`, 'hits', 1)
         .get(`memrev:${id}`)
         .exec();
-      const revision = parseInt((pipe && pipe[1] && pipe[1][1]) || '0', 10);
+      // ioredis pipelines resolve with per-command [err, result] tuples instead
+      // of rejecting; an unchecked error slot would turn a failed increment or
+      // revision read into a fabricated success.
+      for (const [err] of pipe) {
+        if (err) throw err;
+      }
+      const revision = parseInt(pipe[1][1] || '0', 10);
       const entry = entryToObject(raw);
       entry.hits += 1;
       return { content: [{ type: 'text', text: JSON.stringify({ id, ...entry, revision }, null, 2) }] };
@@ -450,12 +507,16 @@ function buildMcpServer() {
       title: z.string().describe('Short descriptive title'),
       body: z.string().describe('Full memory content'),
       type: z.string().describe('Memory type: pattern, decision, reference, feedback, incident, project, entity, state'),
-      tags: z.array(z.string()).describe('Tags for indexing and retrieval'),
+      tags: z.array(
+        z.string()
+          .min(1, 'tags must not be empty strings')
+          .refine((t) => !t.includes(','), { message: 'tags must not contain commas' })
+      ).describe('Tags for indexing and retrieval. Tags must be non-empty and must not contain commas.'),
       source: z.string().optional().default('unknown').describe('Who created/updated this entry'),
       project: z.string().optional().default('').describe('Project scope (empty = cross-project)'),
       ttl: z.number().int().positive().optional().describe('Seconds until expiry (omit for permanent)'),
       if_version: z.number().int().min(0).optional().describe('Compare-and-set: apply only if the current revision equals this. 0 means create-if-absent. Omit for an unconditional write.'),
-      operation_id: z.string().min(1).max(200).optional().describe('Idempotency key. Replaying a recorded id returns the original result and writes nothing. Retained for 7 days.'),
+      operation_id: z.string().min(1).max(200).optional().describe(`Idempotency key. Replaying a recorded id returns the original result and writes nothing. Retained for ${OPERATION_ID_TTL_SECONDS} seconds.`),
     },
     async ({ id, title, body, type, tags, source, project, ttl, if_version, operation_id }) => {
       const result = JSON.parse(await redis.memorySetAtomic(
@@ -476,7 +537,8 @@ function buildMcpServer() {
         String(MAX_VERSIONS_PER_ENTRY),
         if_version === undefined ? '' : String(if_version),
         operation_id ? '1' : '0',
-        String(OPERATION_ID_TTL_SECONDS)
+        String(OPERATION_ID_TTL_SECONDS),
+        ''
       ));
 
       if (result.status === 'conflict') {
@@ -484,16 +546,18 @@ function buildMcpServer() {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'conflict', id, current_revision: result.current_revision, expected_version: result.expected_version }, null, 2) }] };
       }
 
+      if (result.status === 'op_mismatch') {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'operation_id_mismatch', id, recorded_id: result.recorded_id }, null, 2) }] };
+      }
+
       if (result.status === 'replayed') {
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id: result.id, operation: result.operation, revision: result.revision, replayed: true }, null, 2) }] };
+        const warning = await entryCountWarning();
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id: result.id, operation: result.operation, revision: result.revision, replayed: true, warning }, null, 2) }] };
       }
 
       metricWriteTotal.inc();
 
-      const totalKeys = await scanKeys('mem:*');
-      const warning = totalKeys.length > MAX_ENTRIES_WARN
-        ? `Entry count (${totalKeys.length}) exceeds soft cap of ${MAX_ENTRIES_WARN}. Consider running memory_prune_candidates.`
-        : null;
+      const warning = await entryCountWarning();
 
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: result.operation, revision: result.revision, warning }, null, 2) }] };
     }
@@ -549,17 +613,17 @@ function buildMcpServer() {
     'Delete a memory entry. Writes a tombstone version, removes from all indexes.',
     { id: z.string().describe('Memory entry ID to delete') },
     async ({ id }) => {
-      const existing = await redis.hgetall(`mem:${id}`);
-      if (!existing || !existing.title) {
+      const result = JSON.parse(await redis.memoryDeleteAtomic(
+        `mem:${id}`,
+        `memver:${id}`,
+        `memrev:${id}`,
+        nowIso(),
+        String(MAX_VERSIONS_PER_ENTRY)
+      ));
+      if (result.status === 'not_found') {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
-      // The counter is a separate key, so it survives the DEL below. That is what
-      // stops a stale if_version from matching a later re-created entry.
-      const revision = await redis.incr(`memrev:${id}`);
-      await pushVersion(id, existing, 'deleted', revision);
-      await removeFromIndexes(id, existing);
-      await redis.del(`mem:${id}`);
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted', revision }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted', revision: result.revision }, null, 2) }] };
     }
   );
 
@@ -597,32 +661,35 @@ function buildMcpServer() {
       try { version = JSON.parse(raw); }
       catch { return { content: [{ type: 'text', text: JSON.stringify({ error: 'Could not parse version snapshot' }) }] }; }
 
-      const existing = await redis.hgetall(`mem:${id}`);
-      if (existing && existing.title) await removeFromIndexes(id, existing);
-
+      // Snapshots are immutable, so reading here and writing below is safe: the
+      // write itself goes through the same atomic script as memory_set, with
+      // 'KEEP' leaving whatever expiry the live entry has untouched.
       const tags = Array.isArray(version.tags) ? version.tags : [];
-      const fields = {
-        title: version.title || '',
-        body: version.body || '',
-        type: version.type || '',
-        source: version.source || 'unknown',
-        project: version.project || '',
-        updated: nowIso(),
-        hits: existing ? (existing.hits || '0') : '0',
-        ttl: existing ? (existing.ttl || '') : '',
-        tags: tags.join(','),
-      };
-
-      // Bumped only here, after the version has been found and parsed, so a
-      // failed rollback does not move the revision.
-      const revision = await redis.incr(`memrev:${id}`);
-
-      await redis.hset(`mem:${id}`, fields);
-      await addToIndexes(id, fields.type, fields.project, tags);
-      await pushVersion(id, { ...fields }, `rollback_to_${version_index}`, revision);
+      const operation = `rollback_to_${version_index}`;
+      const result = JSON.parse(await redis.memorySetAtomic(
+        `mem:${id}`,
+        `memver:${id}`,
+        `memrev:${id}`,
+        '',
+        id,
+        version.title || '',
+        version.body || '',
+        version.type || '',
+        tags.join(','),
+        JSON.stringify(tags),
+        version.source || 'unknown',
+        version.project || '',
+        nowIso(),
+        'KEEP',
+        String(MAX_VERSIONS_PER_ENTRY),
+        '',
+        '0',
+        String(OPERATION_ID_TTL_SECONDS),
+        operation
+      ));
       metricWriteTotal.inc();
 
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: `rollback_to_${version_index}`, restored_from: version.updated || 'unknown', revision }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation, restored_from: version.updated || 'unknown', revision: result.revision }, null, 2) }] };
     }
   );
 
