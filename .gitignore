@@ -4,3 +4,9 @@ node_modules/
 # Local session/handoff notes. Kept out of the published repo because they carry
 # deployment detail that is not useful to anyone consuming the image.
 STATE.md
+ISSUES-BACKLOG.md
+
+# Agent worktrees. These are checkouts of this same repo, so committing them
+# would nest the repo inside itself. Only worktrees/ is ignored, so committed
+# tooling config such as .claude/settings.json stays possible.
+.claude/worktrees/
