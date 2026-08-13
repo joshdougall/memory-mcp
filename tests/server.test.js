@@ -1390,6 +1390,82 @@ describe('memory-mcp server', () => {
     await raw.quit();
     await c.close();
   });
+
+  // --------------------------------------------------------------------------
+  // memory_get atomicity
+  // --------------------------------------------------------------------------
+
+  it('concurrent memory_get calls each report a distinct, authoritative hit count', async () => {
+    // Previously memory_get read the entry, then incremented in a second round
+    // trip, and synthesised the response as raw.hits + 1. Concurrent readers all
+    // saw the same starting value, so N callers reported the same count while the
+    // store advanced by N.
+    const setup = await client();
+    const id = uid();
+    await call(setup, 'memory_set', {
+      id, title: 'Contended read', body: 'b', type: 'pattern',
+      tags: ['get-race'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await setup.close();
+
+    const READERS = 10;
+    const clients = await Promise.all(Array.from({ length: READERS }, () => client()));
+    const results = await Promise.all(clients.map((c) => call(c, 'memory_get', { id })));
+    await Promise.all(clients.map((c) => c.close()));
+
+    const reported = results.map((r) => r.hits).sort((a, b) => a - b);
+    expect(reported).toEqual(Array.from({ length: READERS }, (_, i) => i + 1));
+
+    // And the last reported value matches what is actually stored.
+    const raw = rawClient();
+    expect(parseInt(await raw.hget(`mem:${id}`, 'hits'), 10)).toBe(READERS);
+    await raw.quit();
+  });
+
+  it('memory_get on a missing id creates no key', async () => {
+    // The increment must be conditional on the entry existing. An unconditional
+    // HINCRBY would create a mem:<id> hash holding only hits, with no title and
+    // no TTL, which every read and cleanup path then treats as absent while the
+    // mem:* scan still counts it. Nothing in the API can remove such a key.
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    const missing = await call(c, 'memory_get', { id });
+    expect(missing.error).toMatch(/Not found/);
+    expect(await raw.exists(`mem:${id}`)).toBe(0);
+
+    await raw.quit();
+    await c.close();
+  });
+
+  it('memory_get does not revive an entry deleted between the read and the increment', async () => {
+    // The race itself cannot be interleaved through the public API, so this
+    // asserts the invariant it produces: after a delete, no amount of reading
+    // brings the key back in any form.
+    const c = await client();
+    const raw = rawClient();
+    const id = uid();
+
+    await call(c, 'memory_set', {
+      id, title: 'Doomed read target', body: 'b', type: 'pattern',
+      tags: ['get-ghost'], source: 'test-suite', project: 'memory-mcp-test',
+    });
+    await call(c, 'memory_delete', { id });
+    expect(await raw.exists(`mem:${id}`)).toBe(0);
+
+    for (let i = 0; i < 5; i++) {
+      const got = await call(c, 'memory_get', { id });
+      expect(got.error).toMatch(/Not found/);
+    }
+
+    // No ghost, and nothing for the entry gauge to over-count.
+    expect(await raw.exists(`mem:${id}`)).toBe(0);
+    expect(await raw.hgetall(`mem:${id}`)).toEqual({});
+
+    await raw.quit();
+    await c.close();
+  });
 });
 
 // ============================================================================
