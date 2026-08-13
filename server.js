@@ -378,8 +378,40 @@ redis.call('DEL', memKey)
 return cjson.encode({ status = 'ok', revision = newRev })
 `;
 
+// memory_get is a read, but it counts hits, so it mutates and needs the same
+// atomicity as the write paths. Splitting the existence check from the increment
+// let HINCRBY land after a delete or a TTL expiry, and HINCRBY creates a missing
+// key: the result was a mem:<id> hash holding only hits, with no title and no
+// TTL. Because existence is defined by the title field everywhere else, such a
+// key is invisible to memory_get, memory_list, memory_delete and
+// prune_candidates, while the mem:* scan still counts it toward
+// memory_entries_total and the soft-cap warning. Nothing in the API could remove
+// it. One EVAL closes the window by construction.
+//
+// KEYS: 1 mem:<id>  2 memrev:<id>
+const MEMORY_GET_LUA = `
+local memKey, revKey = KEYS[1], KEYS[2]
+
+local flat = redis.call('HGETALL', memKey)
+local entry = {}
+for i = 1, #flat, 2 do entry[flat[i]] = flat[i + 1] end
+
+if entry.title == nil then
+  return cjson.encode({ status = 'not_found' })
+end
+
+-- Report what HINCRBY returned rather than the value read above. Two concurrent
+-- readers both see the same starting count, so synthesising read + 1 makes both
+-- report the same number while the stored counter advances by two.
+local hits = redis.call('HINCRBY', memKey, 'hits', 1)
+local revision = tonumber(redis.call('GET', revKey) or '0')
+
+return cjson.encode({ status = 'ok', entry = entry, hits = hits, revision = revision })
+`;
+
 redis.defineCommand('memorySetAtomic', { numberOfKeys: 4, lua: LUA_COMMON + MEMORY_SET_LUA });
 redis.defineCommand('memoryDeleteAtomic', { numberOfKeys: 3, lua: LUA_COMMON + MEMORY_DELETE_LUA });
+redis.defineCommand('memoryGetAtomic', { numberOfKeys: 2, lua: MEMORY_GET_LUA });
 
 // ============================================================================
 // MCP SERVER
@@ -388,7 +420,7 @@ redis.defineCommand('memoryDeleteAtomic', { numberOfKeys: 3, lua: LUA_COMMON + M
 function buildMcpServer() {
   const server = new McpServer({
     name: 'memory-mcp',
-    version: '1.1.1',
+    version: '1.1.2',
   });
 
   server.tool(
@@ -478,24 +510,14 @@ function buildMcpServer() {
     'Retrieve a single memory entry by ID. Increments the hit counter.',
     { id: z.string().describe('Memory entry ID (without mem: prefix)') },
     async ({ id }) => {
-      const raw = await redis.hgetall(`mem:${id}`);
-      if (!raw || !raw.title) {
+      const result = JSON.parse(await redis.memoryGetAtomic(`mem:${id}`, `memrev:${id}`));
+      if (result.status === 'not_found') {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
-      const pipe = await redis.pipeline()
-        .hincrby(`mem:${id}`, 'hits', 1)
-        .get(`memrev:${id}`)
-        .exec();
-      // ioredis pipelines resolve with per-command [err, result] tuples instead
-      // of rejecting; an unchecked error slot would turn a failed increment or
-      // revision read into a fabricated success.
-      for (const [err] of pipe) {
-        if (err) throw err;
-      }
-      const revision = parseInt(pipe[1][1] || '0', 10);
-      const entry = entryToObject(raw);
-      entry.hits += 1;
-      return { content: [{ type: 'text', text: JSON.stringify({ id, ...entry, revision }, null, 2) }] };
+      const entry = entryToObject(result.entry);
+      // The script's HINCRBY result, not read + 1.
+      entry.hits = result.hits;
+      return { content: [{ type: 'text', text: JSON.stringify({ id, ...entry, revision: result.revision }, null, 2) }] };
     }
   );
 
