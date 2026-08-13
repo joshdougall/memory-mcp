@@ -194,10 +194,15 @@ The revision moves only on a real mutation: an applied `memory_set`, a `memory_r
 a `memory_delete`. `memory_get` increments the hit counter without moving the revision, so
 reads never invalidate an outstanding compare-and-set.
 
-The revision counter outlives the entry it belongs to. After a delete, a re-created entry
-continues the sequence instead of restarting at 1, so a stale `if_version` from before the
-delete cannot match. One consequence: `if_version=0` against a deleted id returns a conflict
-carrying the current revision rather than creating. Retry with that revision.
+The revision counter outlives the entry it belongs to when the entry is **deleted**. After
+a delete, a re-created entry continues the sequence instead of restarting at 1, so a stale
+`if_version` from before the delete cannot match. One consequence: `if_version=0` against a
+deleted id returns a conflict carrying the current revision rather than creating. Retry
+with that revision.
+
+Natural TTL expiry is different: the counter and the version history share a TTL entry's
+lifetime and expire with it, so an expired id is a clean slate and `if_version=0` creates
+it again at revision 1. Removing an entry's TTL persists all three keys together.
 
 ### `operation_id` (idempotent retries)
 
@@ -213,6 +218,10 @@ The replay check runs ahead of the `if_version` check, so a verbatim retry carry
 now-stale `if_version` still replays rather than conflicting. Records are kept for
 `MEMORY_MCP_OPERATION_ID_TTL_SECONDS` (7 days by default) and are scoped server-wide, not
 per entry.
+
+An `operation_id` names one write to one entry. Reusing a recorded id against a different
+entry is rejected with `{"ok": false, "error": "operation_id_mismatch", "recorded_id": ...}`
+rather than silently replaying the other entry's result and dropping the write.
 
 Conflicts are counted separately from writes in the metrics: `memory_conflict_total` rather
 than `memory_write_total`.
@@ -238,7 +247,7 @@ Each entry is stored as a Redis hash at `mem:<id>`:
 | `title` | Short descriptive title |
 | `body` | Full content |
 | `type` | Entry type |
-| `tags` | Comma-separated tag list |
+| `tags` | Comma-separated tag list (tags may not be empty or contain commas; enforced on write) |
 | `source` | Who wrote it |
 | `project` | Project scope (empty = cross-project) |
 | `created` | ISO date of creation |
@@ -252,6 +261,14 @@ Version history is stored in a Redis list at `memver:<id>` (newest-first, capped
 The revision counter is a separate string key, `memrev:<id>`. It is deliberately not a field
 on the entry hash: it has to survive `memory_delete`, which deletes that hash. It is
 incremented only on semantic mutation, never by `memory_get`.
+
+`memver:<id>` and `memrev:<id>` share a TTL entry's lifetime: they expire alongside it and
+are persisted when its TTL is removed. `memory_delete` persists both, so the tombstone and
+the counter outlive any TTL the entry carried.
+
+Every mutation (`memory_set`, `memory_rollback`, `memory_delete`) executes as a single Lua
+script, so index membership, history order, and the revision counter can never interleave
+across concurrent writers.
 
 Recorded `operation_id` values are hashes at `memop:<operation_id>` holding `memory_id`,
 `revision` and `action`, expiring after `MEMORY_MCP_OPERATION_ID_TTL_SECONDS`.

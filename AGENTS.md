@@ -65,17 +65,20 @@ memory_get(id="my-entry")                     -> { ..., "revision": 7 }
 memory_set(id="my-entry", ..., if_version=7)
 ```
 
-A mismatch returns `{"ok": false, "error": "conflict", "current_revision": N}` and writes
-nothing. Re-read the entry, recompose your change against the current body, and retry with
-the revision the conflict reported. Do not replay your original body.
+A mismatch returns `{"ok": false, "error": "conflict", "id": ..., "current_revision": N,
+"expected_version": M}` and writes nothing. Re-read the entry, recompose your change against
+the current body, and retry with the revision the conflict reported. Do not replay your
+original body.
 
 For retry-safety across a crash, pass a unique `operation_id`. Replaying it returns the
-original result with `"replayed": true` and writes nothing.
+original result with `"replayed": true` and writes nothing. An `operation_id` names one
+write to one entry: reusing it for a different id is rejected with
+`"error": "operation_id_mismatch"`.
 
 ## Conventions
 
 - `id`: slug-style, descriptive — e.g. `myproject-db-choice`, `deploy-never-force-push`
-- `tags`: include the project name and topic — e.g. `["myproject", "database"]`
+- `tags`: include the project name and topic — e.g. `["myproject", "database"]`. Tags must be non-empty and must not contain commas (the server rejects both)
 - `project`: project name for project-specific entries, empty string for cross-project knowledge
 - `source`: set to the agent or person writing the entry — e.g. `"claude-code"`, `"cursor"`, `"josh"`
 
