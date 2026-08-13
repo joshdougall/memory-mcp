@@ -116,7 +116,7 @@ Copy `.env.example` to `.env` and edit as needed.
 | `MEMORY_MCP_BIND` | `127.0.0.1` | Interface to bind on. Use `0.0.0.0` only with `AUTH_TOKEN` set. |
 | `MEMORY_MCP_HOST_PORT` | `3106` | Port exposed on the host |
 | `MEMORY_MCP_AUTH_TOKEN` | _(empty)_ | Bearer token for `/mcp`. Empty = no auth. Generate: `openssl rand -hex 32` |
-| `MEMORY_MCP_MAX_ENTRIES_WARN` | `300` | Soft cap — warns on write when exceeded |
+| `MEMORY_MCP_MAX_ENTRIES_WARN` | `1000` | Soft cap — warns on write when exceeded |
 | `MEMORY_MCP_MAX_VERSIONS_PER_ENTRY` | `20` | Max version snapshots per entry |
 | `MEMORY_MCP_OPERATION_ID_TTL_SECONDS` | `604800` | How long an `operation_id` stays recorded for idempotent retries (7 days) |
 | `MEMORY_MCP_MEM_LIMIT` | `256m` | Container memory cap |

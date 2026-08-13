@@ -5,6 +5,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { createServer } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import Redis from 'ioredis';
 import {
   Registry,
@@ -18,10 +20,14 @@ import {
 // CONFIGURATION
 // ============================================================================
 
+const VERSION = JSON.parse(
+  readFileSync(new URL('./package.json', import.meta.url), 'utf8')
+).version;
+
 const PORT = parseInt(process.env.PORT || '8000', 10);
 const VALKEY_URL = process.env.VALKEY_URL || 'redis://valkey:6379';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
-const MAX_ENTRIES_WARN = parseInt(process.env.MAX_ENTRIES_WARN || '300', 10);
+const MAX_ENTRIES_WARN = parseInt(process.env.MAX_ENTRIES_WARN || '1000', 10);
 const MAX_VERSIONS_PER_ENTRY = parseInt(process.env.MAX_VERSIONS_PER_ENTRY || '20', 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(1024 * 1024), 10);
 const OPERATION_ID_TTL_SECONDS = parseInt(process.env.OPERATION_ID_TTL_SECONDS || String(7 * 24 * 60 * 60), 10);
@@ -132,8 +138,9 @@ setInterval(refreshGauges, 60_000);
 
 function checkAuth(req, res) {
   if (!AUTH_TOKEN) return true;
-  const header = req.headers['authorization'] || '';
-  if (header === `Bearer ${AUTH_TOKEN}`) return true;
+  const expected = Buffer.from(`Bearer ${AUTH_TOKEN}`);
+  const provided = Buffer.from(req.headers['authorization'] || '');
+  if (provided.length === expected.length && timingSafeEqual(provided, expected)) return true;
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Unauthorized' }));
   return false;
@@ -420,7 +427,7 @@ redis.defineCommand('memoryGetAtomic', { numberOfKeys: 2, lua: MEMORY_GET_LUA })
 function buildMcpServer() {
   const server = new McpServer({
     name: 'memory-mcp',
-    version: '1.1.2',
+    version: VERSION,
   });
 
   server.tool(
@@ -804,6 +811,10 @@ const httpServer = createServer(async (req, res) => {
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       const mcpServer = buildMcpServer();
       await mcpServer.connect(transport);
+      res.on('close', () => {
+        transport.close();
+        mcpServer.close();
+      });
 
       try {
         await transport.handleRequest(req, res, parsed);
@@ -821,6 +832,21 @@ const httpServer = createServer(async (req, res) => {
   res.writeHead(404);
   res.end();
 });
+
+function shutdown(signal) {
+  console.log(`[memory-mcp] ${signal} received, shutting down`);
+  httpServer.close(() => {
+    redis
+      .quit()
+      .catch(() => {})
+      .finally(() => process.exit(0));
+  });
+  // Hard deadline in case a connection refuses to drain
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[memory-mcp] listening on port ${PORT}`);
