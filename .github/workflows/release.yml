@@ -88,3 +88,43 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  github-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    # Gated on the image: a release entry pointing at a version with no
+    # published image would be worse than no entry at all.
+    needs: [build]
+    permissions:
+      contents: write
+
+    steps:
+      # fetch-depth 0 so the annotated tag object, not just the commit, is
+      # available to read release notes from.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release from the tag annotation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, nothing to do."
+            exit 0
+          fi
+
+          # Prefer the annotated tag message, which is where this project keeps
+          # its release notes. Fall back to generated notes for a lightweight tag.
+          notes=$(git tag -l --format='%(contents:body)' "$TAG")
+          if [ -n "$notes" ]; then
+            printf '%s\n' "$notes" > /tmp/notes.md
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md --verify-tag
+          else
+            echo "Tag $TAG has no annotation body; generating notes from commits."
+            gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+          fi
