@@ -99,8 +99,6 @@ jobs:
       contents: write
 
     steps:
-      # fetch-depth 0 so the annotated tag object, not just the commit, is
-      # available to read release notes from.
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -118,13 +116,27 @@ jobs:
             exit 0
           fi
 
-          # Prefer the annotated tag message, which is where this project keeps
-          # its release notes. Fall back to generated notes for a lightweight tag.
-          notes=$(git tag -l --format='%(contents:body)' "$TAG")
-          if [ -n "$notes" ]; then
-            printf '%s\n' "$notes" > /tmp/notes.md
-            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md --verify-tag
-          else
-            echo "Tag $TAG has no annotation body; generating notes from commits."
-            gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+          # actions/checkout leaves refs/tags/<tag> pointing straight at the
+          # commit, so the annotated tag object is absent even with
+          # fetch-depth: 0. That matters because %(contents:body) on a
+          # lightweight tag silently returns the *commit* message body instead
+          # of the annotation, which is wrong but non-empty, so a naive
+          # "use the annotation if there is one" check never notices.
+          # Fetch the real object and decide from its type, not from emptiness.
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+
+          object_type=$(git cat-file -t "$TAG")
+          echo "refs/tags/$TAG is a $object_type object"
+
+          if [ "$object_type" = "tag" ]; then
+            git tag -l --format='%(contents:body)' "$TAG" > /tmp/notes.md
+            if [ -s /tmp/notes.md ]; then
+              echo "Using the annotated tag message as release notes."
+              gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md --verify-tag
+              exit 0
+            fi
+            echo "Annotated tag has an empty body."
           fi
+
+          echo "No usable annotation; generating notes from commit history."
+          gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
