@@ -52,10 +52,33 @@ export function freePort() {
   });
 }
 
+// A child's 'exit' event carries a code XOR a signal: a normal exit sets code
+// and leaves signal null, a signal death sets signal and leaves code null.
+// Reading only code treats a signal death as "still running" (code stays
+// null forever), so the liveness recheck below must fall back to the signal.
+export function resolveExitStatus(code, signal) {
+  return code ?? signal;
+}
+
+// Terminates a child the same way regardless of why we are giving up on it:
+// ask nicely with SIGTERM, wait for the exit event, and escalate to SIGKILL
+// on an unref'd timer if it has not exited by timeoutMs. Used both by the
+// happy-path stop() and by the failed-startup cleanup path, so a slow or
+// SIGTERM-ignoring child cannot outlive either caller and leak a process
+// bound to a port with an open Redis connection.
+export async function terminateChild(proc, timeoutMs = 5000) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  await new Promise((resolve) => {
+    proc.once('exit', resolve);
+    proc.kill('SIGTERM');
+    setTimeout(() => { proc.kill('SIGKILL'); resolve(); }, timeoutMs).unref();
+  });
+}
+
 async function waitReady(base, proc, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   let exited = null;
-  proc.once('exit', (code) => { exited = code; });
+  proc.once('exit', (code, signal) => { exited = resolveExitStatus(code, signal); });
   while (Date.now() < deadline) {
     if (exited !== null) throw new Error(`server exited early with code ${exited}`);
     try {
@@ -94,7 +117,10 @@ export async function startEnv({ db }) {
   try {
     await waitReady(base, proc);
   } catch (err) {
-    proc.kill('SIGTERM');
+    // Mirror stop()'s termination pattern here too: a failed startup must not
+    // leave the child orphaned, still bound to its port and holding an open
+    // Redis connection, for the rest of the vitest session.
+    await terminateChild(proc);
     await redis.quit();
     throw err;
   }
@@ -113,11 +139,7 @@ export async function startEnv({ db }) {
       try { await redis.flushdb(); } catch { /* best effort */ }
       try { await redis.quit(); } catch { /* best effort */ }
       rmSync(dir, { recursive: true, force: true });
-      await new Promise((resolve) => {
-        proc.once('exit', resolve);
-        proc.kill('SIGTERM');
-        setTimeout(() => { proc.kill('SIGKILL'); resolve(); }, 5000).unref();
-      });
+      await terminateChild(proc);
     },
   };
 }

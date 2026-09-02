@@ -1,5 +1,13 @@
 import { describe, it, expect, afterAll } from 'vitest';
-import { startEnv, assertIsolated, isolatedUrl, freePort } from './helpers/compact-env.js';
+import { spawn } from 'node:child_process';
+import {
+  startEnv,
+  assertIsolated,
+  isolatedUrl,
+  freePort,
+  resolveExitStatus,
+  terminateChild,
+} from './helpers/compact-env.js';
 
 describe('assertIsolated', () => {
   it('rejects a URL with no db index', () => {
@@ -53,5 +61,46 @@ describe('startEnv', () => {
 
   it('starts empty because it flushed its own db', async () => {
     expect(await env.redis.dbsize()).toBe(0);
+  });
+});
+
+describe('resolveExitStatus', () => {
+  it('prefers the exit code when the process exited normally', () => {
+    expect(resolveExitStatus(1, null)).toBe(1);
+  });
+  it('treats a clean exit (code 0) as a real, non-null status', () => {
+    expect(resolveExitStatus(0, null)).toBe(0);
+  });
+  it('falls back to the signal when a signal killed the process', () => {
+    expect(resolveExitStatus(null, 'SIGTERM')).toBe('SIGTERM');
+  });
+});
+
+describe('terminateChild', () => {
+  it('escalates to SIGKILL when the child ignores SIGTERM, and does not hang', async () => {
+    // A child that installs a SIGTERM handler and never exits on its own,
+    // to force terminateChild down the escalation path deterministically.
+    const proc = spawn(process.execPath, [
+      '-e',
+      "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
+    ]);
+    await new Promise((resolve) => proc.once('spawn', resolve));
+
+    const start = Date.now();
+    await terminateChild(proc, 200);
+    const elapsed = Date.now() - start;
+
+    expect(proc.exitCode !== null || proc.signalCode !== null).toBe(true);
+    // Should resolve close to the 200ms escalation timeout, not hang for the
+    // production 5000ms default and not resolve instantly either.
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it('resolves immediately for a child that already exited', async () => {
+    const proc = spawn(process.execPath, ['-e', '']);
+    await new Promise((resolve) => proc.once('exit', resolve));
+    const start = Date.now();
+    await terminateChild(proc, 5000);
+    expect(Date.now() - start).toBeLessThan(200);
   });
 });
