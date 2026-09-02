@@ -28,3 +28,20 @@ export function parseLinks(body) {
   }
   return out;
 }
+
+export function buildGraph(entries) {
+  const ids = new Set(entries.map((e) => e.id));
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  const inbound = new Map();
+  const dangling = new Map();
+
+  for (const e of entries) {
+    for (const target of parseLinks(e.body)) {
+      if (target === e.id) continue;
+      const bucket = ids.has(target) ? inbound : dangling;
+      if (!bucket.has(target)) bucket.set(target, new Set());
+      bucket.get(target).add(e.id);
+    }
+  }
+  return { ids, byId, inbound, dangling };
+}

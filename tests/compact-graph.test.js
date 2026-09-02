@@ -69,3 +69,40 @@ describe('parseLinks', () => {
     expect(parseLinks(body)).toEqual(['should-be-extracted']);
   });
 });
+
+import { buildGraph } from '../compact/graph.js';
+
+function entry(id, body = '', over = {}) {
+  return { id, title: id, body, type: 'reference', tags: [], source: 'test',
+           project: '', created: '2026-08-01', updated: '2026-08-01', hits: 0, ttl: '', ...over };
+}
+
+describe('buildGraph', () => {
+  it('records inbound citations for existing targets', () => {
+    const g = buildGraph([entry('a', 'see [[b]]'), entry('b')]);
+    expect([...g.inbound.get('b')]).toEqual(['a']);
+    expect(g.inbound.has('a')).toBe(false);
+  });
+
+  it('records dangling targets separately', () => {
+    const g = buildGraph([entry('a', 'see [[ghost]]')]);
+    expect([...g.dangling.get('ghost')]).toEqual(['a']);
+    expect(g.inbound.has('ghost')).toBe(false);
+  });
+
+  it('counts a TTL-bearing entry as a citation source', () => {
+    const g = buildGraph([entry('a', 'see [[b]]', { ttl: '2592000' }), entry('b')]);
+    expect([...g.inbound.get('b')]).toEqual(['a']);
+  });
+
+  it('does not count links inside a managed block', () => {
+    const body = `<!-- compaction:backlinks:start -->\n- [[b]]\n<!-- compaction:backlinks:end -->`;
+    const g = buildGraph([entry('a', body), entry('b')]);
+    expect(g.inbound.has('b')).toBe(false);
+  });
+
+  it('ignores an entry citing itself', () => {
+    const g = buildGraph([entry('a', 'see [[a]]')]);
+    expect(g.inbound.has('a')).toBe(false);
+  });
+});
