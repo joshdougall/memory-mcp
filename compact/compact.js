@@ -4,9 +4,10 @@ import { buildGraph } from './graph.js';
 import { planEntry, planStubs } from './plan.js';
 import { RunLog, writeReport } from './runlog.js';
 import {
-  connect, census, getEntry, setEntry, health, withDeadline,
+  connect, census, setEntry, health, withDeadline,
   TruncatedCensusError, DeadlineError, CENSUS_CAP,
 } from './store.js';
+import * as defaultStore from './store.js';
 
 export const EXIT = { OK: 0, MCP: 1, BUDGET: 2, TRUNCATED: 3, PARTIAL: 4, LOCKED: 5, LOCAL: 6 };
 
@@ -34,7 +35,11 @@ export async function run({
     const check = () => { if (remaining() <= 0) throw new DeadlineError('budget exhausted'); };
     const bounded = (promise, label) => {
       check();
-      return withDeadline(promise, remaining(), label);
+      // Math.max(0, ...) because argument evaluation samples remaining() a
+      // second time, microseconds after check() sampled it: without the
+      // clamp that second read can be negative and setTimeout would warn
+      // (Node clamps it to ~1ms anyway, so this only avoids the warning).
+      return withDeadline(promise, Math.max(0, remaining()), label);
     };
     const safeRecord = (kind, fields) => {
       try { log.record(kind, fields); } catch (err) { throw new LocalError(err.message); }
@@ -138,9 +143,9 @@ export async function run({
   }
 }
 
-export async function applyOne(client, p, rows, bounded, safeRecord, skipped) {
+export async function applyOne(client, p, rows, bounded, safeRecord, skipped, store = defaultStore) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const fresh = await bounded(getEntry(client, p.id), `get:${p.id}`);
+    const fresh = await bounded(store.getEntry(client, p.id), `get:${p.id}`);
     safeRecord('read', { id: p.id });
     if (!fresh) { skipped.push(`${p.id}: vanished between census and write`); return; }
 
@@ -159,7 +164,7 @@ export async function applyOne(client, p, rows, bounded, safeRecord, skipped) {
     const operationId = randomUUID();
     safeRecord('intent', { id: p.id, operation_id: operationId, preimage: fresh.entry });
     const res = await bounded(
-      setEntry(client, { ...replanned.write, if_version: fresh.revision, operation_id: operationId }),
+      store.setEntry(client, { ...replanned.write, if_version: fresh.revision, operation_id: operationId }),
       `set:${p.id}`,
     );
 
