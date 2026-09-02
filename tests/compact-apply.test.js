@@ -14,12 +14,15 @@ function entryRow(id, over = {}) {
 }
 
 // A stub client: `gets` is consumed one per getEntry call, `sets` one per setEntry.
+// setEntry also records the full args it was called with, in call order, on
+// `__setCalls`, so a test can prove the caller behaved correctly rather than
+// merely that it received the canned result back.
 function stubClient({ gets, sets }) {
-  return { __gets: [...gets], __sets: [...sets] };
+  return { __gets: [...gets], __sets: [...sets], __setCalls: [] };
 }
 const stubStore = {
   getEntry: async (c) => c.__gets.shift(),
-  setEntry: async (c) => c.__sets.shift(),
+  setEntry: async (c, args) => { c.__setCalls.push(args); return c.__sets.shift(); },
 };
 
 describe('applyOne', () => {
@@ -35,6 +38,15 @@ describe('applyOne', () => {
     expect(h.records.filter((r) => r.kind === 'rejected')).toHaveLength(1);
     expect(h.records.filter((r) => r.kind === 'applied')).toHaveLength(1);
     expect(h.skipped).toEqual([]);
+    // Each attempt must carry its own operation_id: a retry that reuses the
+    // first attempt's id would replay as a silent no-op against a server that
+    // treats operation_id as an idempotency key, reporting success without
+    // ever repairing the entry.
+    const opIds = client.__setCalls.map((args) => args.operation_id);
+    expect(opIds).toHaveLength(2);
+    expect(opIds[0]).toBeTruthy();
+    expect(opIds[1]).toBeTruthy();
+    expect(opIds[0]).not.toBe(opIds[1]);
   });
 
   it('skips and reports after two conflicts', async () => {
@@ -81,10 +93,21 @@ describe('applyOne', () => {
       sets: [{ ok: false, error: 'conflict' }, { ok: true, revision: 3 }],
     });
     await applyOne(client, p, [row], bounded, h.safeRecord, h.skipped, stubStore);
-    expect(h.records.filter((r) => r.kind === 'intent')).toHaveLength(2);
+    const intents = h.records.filter((r) => r.kind === 'intent');
+    expect(intents).toHaveLength(2);
     // and each intent carries a restorable preimage
-    for (const rec of h.records.filter((r) => r.kind === 'intent')) {
+    for (const rec of intents) {
       expect(rec.preimage.project).toBe('""');
     }
+    // Tie each logged intent to the actual setEntry call it preceded, rather
+    // than assuming the log and the call agree: same operation_id per attempt,
+    // and the two attempts must not share one.
+    const setOpIds = client.__setCalls.map((args) => args.operation_id);
+    expect(setOpIds).toHaveLength(2);
+    for (let i = 0; i < intents.length; i += 1) {
+      expect(setOpIds[i]).toBeTruthy();
+      expect(intents[i].operation_id).toBe(setOpIds[i]);
+    }
+    expect(setOpIds[0]).not.toBe(setOpIds[1]);
   });
 });
