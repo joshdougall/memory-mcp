@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireLock } from '../compact/lock.js';
@@ -12,6 +12,37 @@ beforeEach(() => {
   writeFileSync(path, ''); // proper-lockfile locks an existing path
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+// Waits for `marker` to appear in the child's stdout, so the parent proceeds
+// only once the child has provably reached that point, never on a guessed
+// timeout. Rejects if the child exits first without ever printing it.
+function waitForMarker(child, marker) {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    const onData = (chunk) => {
+      buf += chunk;
+      if (buf.includes(marker)) {
+        child.stdout.off('data', onData);
+        resolve();
+      }
+    };
+    child.stdout.on('data', onData);
+    child.once('error', reject);
+    child.once('exit', (code) => {
+      if (!buf.includes(marker)) {
+        reject(new Error(`child exited (code ${code}) before printing "${marker}". stdout: ${buf}`));
+      }
+    });
+  });
+}
+
+function waitForExit(child) {
+  if (child.exitCode !== null) return Promise.resolve(child.exitCode);
+  return new Promise((resolve, reject) => {
+    child.once('exit', (code) => resolve(code));
+    child.once('error', reject);
+  });
+}
 
 describe('acquireLock', () => {
   it('grants the lock when free', () => {
@@ -33,20 +64,56 @@ describe('acquireLock', () => {
     second.release();
   });
 
-  it('refuses a lock held by a live separate process', () => {
-    // A real second process, because the whole point is cross-process exclusion
-    // and a same-process test proves nothing about that.
-    const holder = spawnSync(process.execPath, [
+  it('refuses the parent while a live separate process concurrently holds the lock, then grants it once that process exits', async () => {
+    // A real second process running concurrently with this one (spawn, not
+    // spawnSync), because cross-process exclusion is the entire point and a
+    // process that has already exited by the time we check proves nothing
+    // about contention.
+    const holder = spawn(process.execPath, [
       '--input-type=module', '-e',
       `import { acquireLock } from ${JSON.stringify(join(process.cwd(), 'compact/lock.js'))};
        const h = acquireLock(${JSON.stringify(path)});
-       console.log(h ? 'held' : 'refused');`,
-    ], { encoding: 'utf8' });
-    expect(holder.stdout.trim()).toBe('held');
-    // That process has exited, so its lock must have been released on exit.
-    const after = acquireLock(path);
-    expect(after).not.toBeNull();
-    after.release();
+       if (!h) { console.log('refused'); process.exit(1); }
+       console.log('ready');
+       setTimeout(() => process.exit(0), 1500);`,
+    ]);
+
+    try {
+      // Wait for proof the child holds the lock, rather than sleeping a
+      // guessed interval, so this is not timing-dependent.
+      await waitForMarker(holder, 'ready');
+
+      // The holder is provably alive and holding the lock right now.
+      expect(acquireLock(path)).toBeNull();
+
+      await waitForExit(holder);
+
+      // The holder has exited, so its lock must have been released.
+      const after = acquireLock(path);
+      expect(after).not.toBeNull();
+      after.release();
+    } finally {
+      // Cleanup path: never leak the child process if an assertion above throws.
+      if (holder.exitCode === null) holder.kill('SIGKILL');
+    }
+  });
+
+  it('refuses a spawned process while the parent holds the lock', () => {
+    // The inverse direction: this test proves the lock excludes outward
+    // (parent holds, child is refused), not just inward.
+    const held = acquireLock(path);
+    expect(held).not.toBeNull();
+    try {
+      const child = spawnSync(process.execPath, [
+        '--input-type=module', '-e',
+        `import { acquireLock } from ${JSON.stringify(join(process.cwd(), 'compact/lock.js'))};
+         const h = acquireLock(${JSON.stringify(path)});
+         console.log(h ? 'held' : 'refused');`,
+      ], { encoding: 'utf8' });
+      expect(child.stdout.trim()).toBe('refused');
+    } finally {
+      held.release();
+    }
   });
 
   it('releases automatically when the holding process exits', () => {
