@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { stripManagedBlock, parseLinks, BACKLINK_START, BACKLINK_END } from '../compact/graph.js';
+import { stripManagedBlock, stripCode, parseLinks, BACKLINK_START, BACKLINK_END } from '../compact/graph.js';
 
 describe('marker constants', () => {
   it('BACKLINK_START has the correct literal value', () => {
@@ -57,6 +57,50 @@ describe('stripManagedBlock', () => {
   });
 });
 
+describe('stripCode', () => {
+  it('replaces an inline code span with a single space', () => {
+    expect(stripCode('before `[[x]]` after')).toBe('before   after');
+  });
+
+  it('replaces a multi-backtick inline span, ignoring single backticks inside it', () => {
+    expect(stripCode('a ``[[x]]`` b')).toBe('a   b');
+  });
+
+  it('replaces a fenced block delimited by backticks', () => {
+    const body = '```\n[[x]]\n```\nafter';
+    expect(stripCode(body)).toBe(' \nafter');
+  });
+
+  it('replaces a fenced block delimited by tildes', () => {
+    const body = '~~~\n[[x]]\n~~~\nafter';
+    expect(stripCode(body)).toBe(' \nafter');
+  });
+
+  it('ignores a language label on the opening fence', () => {
+    const body = '```js\n[[x]]\n```\nafter';
+    expect(stripCode(body)).toBe(' \nafter');
+  });
+
+  it('treats an unclosed fence as consuming the rest of the body', () => {
+    const body = 'before\n```\n[[x]]\nmore [[y]]';
+    expect(stripCode(body)).toBe('before\n ');
+  });
+
+  it('leaves a run of backticks with no matching close as literal text', () => {
+    expect(stripCode('a `` b')).toBe('a `` b');
+  });
+
+  it('does not fabricate a bracket pair by joining fragments either side of a span', () => {
+    // Deleting the span outright would turn "[" + "[real]]" into "[[real]]".
+    // Replacing with a space must not.
+    expect(stripCode('[`x`[real]]')).toBe('[ [real]]');
+  });
+
+  it('leaves plain prose with no code untouched', () => {
+    expect(stripCode('see [[foo]] and [[bar]]')).toBe('see [[foo]] and [[bar]]');
+  });
+});
+
 describe('parseLinks', () => {
   it('extracts wikilink targets', () => {
     expect(parseLinks('see [[foo]] and [[bar]]')).toEqual(['foo', 'bar']);
@@ -95,6 +139,43 @@ describe('parseLinks', () => {
 
   it('does not capture a link target across a newline', () => {
     expect(parseLinks('[[unclosed\nnext line [[real]]')).toEqual(['real']);
+  });
+
+  // The real defect: a dry run against the live store proposed creating an
+  // entry with id `wikilink`, sourced from personnel-privacy-rule's prose
+  // about the syntax itself, wrapped in backticks as inline code.
+  it('ignores a wikilink written as inline code, alongside a genuine one', () => {
+    const body = 'so a `[[wikilink]]` in an artifact comment is an inert '
+      + 'string to a run and cannot be followed, see [[personnel-privacy-rule]] for the policy';
+    expect(parseLinks(body)).toEqual(['personnel-privacy-rule']);
+  });
+
+  it('ignores wikilinks inside a fenced code block, keeping a genuine one outside it', () => {
+    const body = 'real [[keep]]\n```\n[[fenced-one]]\n[[fenced-two]]\n```\nafter';
+    expect(parseLinks(body)).toEqual(['keep']);
+  });
+
+  it('ignores wikilinks inside a tilde-fenced code block', () => {
+    const body = 'real [[keep]]\n~~~\n[[fenced]]\n~~~';
+    expect(parseLinks(body)).toEqual(['keep']);
+  });
+
+  it('ignores wikilinks inside a fenced block carrying a language label', () => {
+    const body = 'real [[keep]]\n```js\nconst x = "[[fenced]]";\n```';
+    expect(parseLinks(body)).toEqual(['keep']);
+  });
+
+  it('ignores everything after an unclosed fence, including a genuine-looking link', () => {
+    const body = 'real [[keep]]\n```\n[[fenced]]\nmore text [[after-fence]]';
+    expect(parseLinks(body)).toEqual(['keep']);
+  });
+
+  it('ignores a multi-backtick inline span', () => {
+    expect(parseLinks('see ``[[x]]`` and [[keep]]')).toEqual(['keep']);
+  });
+
+  it('does not fabricate a link from fragments left either side of a stripped code span', () => {
+    expect(parseLinks('[`x`[real]] and [[keep]]')).toEqual(['keep']);
   });
 });
 
