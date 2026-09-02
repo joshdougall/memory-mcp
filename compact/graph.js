@@ -6,10 +6,10 @@ export const BACKLINK_END = '<!-- compaction:backlinks:end -->';
 // run would differ from the last by one trailing newline and the zero-write
 // idempotency guarantee would never hold.
 export function stripManagedBlock(body) {
-  const start = body.indexOf(BACKLINK_START);
-  if (start === -1) return body;
-  const endIdx = body.indexOf(BACKLINK_END, start);
+  const endIdx = body.indexOf(BACKLINK_END);
   if (endIdx === -1) return body;
+  const start = body.lastIndexOf(BACKLINK_START, endIdx);
+  if (start === -1) return body;
   let from = start;
   let to = endIdx + BACKLINK_END.length;
   if (from > 0 && body[from - 1] === '\n') from -= 1;

@@ -43,6 +43,14 @@ describe('applyBacklinks', () => {
   it('produces a body whose generated links are invisible to parseLinks', () => {
     expect(parseLinks(applyBacklinks('body', ['a', 'b']))).toEqual([]);
   });
+
+  it('is idempotent when a dangling start marker precedes real content', () => {
+    const input = `${BACKLINK_START}\nstray\nbody`;
+    const first = applyBacklinks(input, ['a', 'b']);
+    const second = applyBacklinks(first, ['a', 'b']);
+    expect(second).toBe(first);
+    expect(first).toContain('stray');
+  });
 });
 
 describe('hasManagedBlock', () => {

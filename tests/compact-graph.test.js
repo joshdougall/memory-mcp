@@ -39,6 +39,11 @@ describe('stripManagedBlock', () => {
     const body = `text\n${BACKLINK_END}\nmore text`;
     expect(stripManagedBlock(body)).toBe(body);
   });
+
+  it('removes only the complete block when a dangling start marker precedes it', () => {
+    const body = `${BACKLINK_START}\nstray\n${BACKLINK_START}\nx\n${BACKLINK_END}`;
+    expect(stripManagedBlock(body)).toBe(`${BACKLINK_START}\nstray`);
+  });
 });
 
 describe('parseLinks', () => {
