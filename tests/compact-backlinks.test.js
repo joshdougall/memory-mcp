@@ -44,6 +44,28 @@ describe('applyBacklinks', () => {
     expect(parseLinks(applyBacklinks('body', ['a', 'b']))).toEqual([]);
   });
 
+  // The orphan END regression, proven end to end against a real server: the
+  // strip returned the body unchanged, a fresh block was appended after the
+  // stray marker every run, and the entry grew by roughly 105 bytes and one
+  // store write a night, forever.
+  it('is idempotent when a dangling end marker precedes real content', () => {
+    const input = `body\n${BACKLINK_END}`;
+    const first = applyBacklinks(input, ['a', 'b']);
+    const second = applyBacklinks(first, ['a', 'b']);
+    const third = applyBacklinks(second, ['a', 'b']);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    expect(first).toContain('body');
+    // Exactly one block, and no stray marker left over from the input.
+    expect(first.split(BACKLINK_START)).toHaveLength(2);
+    expect(first.split(BACKLINK_END)).toHaveLength(2);
+    expect(first).toBe(`body\n${block('a', 'b')}`);
+  });
+
+  it('reads back no citations after an orphan end marker is repaired', () => {
+    expect(parseLinks(applyBacklinks(`body\n${BACKLINK_END}`, ['a', 'b']))).toEqual([]);
+  });
+
   it('is idempotent when a dangling start marker precedes real content', () => {
     const input = `${BACKLINK_START}\nstray\nbody`;
     const first = applyBacklinks(input, ['a', 'b']);

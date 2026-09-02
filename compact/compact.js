@@ -9,7 +9,7 @@ import {
 } from './store.js';
 import * as defaultStore from './store.js';
 
-export const EXIT = { OK: 0, MCP: 1, BUDGET: 2, TRUNCATED: 3, PARTIAL: 4, LOCKED: 5, LOCAL: 6 };
+export const EXIT = { OK: 0, MCP: 1, BUDGET: 2, TRUNCATED: 3, PARTIAL: 4, LOCKED: 5, LOCAL: 6, COMPROMISED: 7 };
 
 const NO_WRITE = new Set(['leave', 'foreign-ttl', 'hold']);
 
@@ -53,7 +53,7 @@ export async function run({
     try {
       safeRecord('start', { dry_run: dryRun });
 
-      if (!(await bounded(health(base ?? new URL(url).origin, remaining()), 'health'))) {
+      if (!(await bounded(health(base ?? new URL(url).origin, Math.max(0, remaining())), 'health'))) {
         safeRecord('error', { stage: 'preflight', message: 'health check failed' });
         code = EXIT.MCP;
         throw new Error('preflight failed');

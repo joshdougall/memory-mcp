@@ -4,6 +4,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireLock } from '../compact/lock.js';
+import { EXIT } from '../compact/compact.js';
 
 let dir, path;
 beforeEach(() => {
@@ -113,6 +114,31 @@ describe('acquireLock', () => {
       expect(child.stdout.trim()).toBe('refused');
     } finally {
       held.release();
+    }
+  });
+
+  // A lock compromised AFTER writes have landed must not look like a benign
+  // skip. EXIT.LOCKED means "another run holds the lock, nothing to see here",
+  // so reusing it here reported a possibly half-modified store as a no-op and
+  // bypassed the exit-4 partial-write rule.
+  it('exits with a code distinct from the benign lock-held code when the lock is compromised', async () => {
+    expect(EXIT.COMPROMISED).not.toBe(EXIT.LOCKED);
+    const holder = spawn(process.execPath, [
+      '--input-type=module', '-e',
+      `import { acquireLock } from ${JSON.stringify(join(process.cwd(), 'compact/lock.js'))};
+       const h = acquireLock(${JSON.stringify(path)});
+       if (!h) { console.log('refused'); process.exit(1); }
+       console.log('ready');
+       setTimeout(() => process.exit(0), 25000);`,
+    ]);
+    try {
+      await waitForMarker(holder, 'ready');
+      // Rip the lock out from under the holder. proper-lockfile's update loop
+      // notices on its next tick and invokes onCompromised.
+      rmSync(`${path}.lock`, { recursive: true, force: true });
+      expect(await waitForExit(holder)).toBe(EXIT.COMPROMISED);
+    } finally {
+      if (holder.exitCode === null) holder.kill('SIGKILL');
     }
   });
 

@@ -47,6 +47,13 @@ describe('applyOne', () => {
     expect(opIds[0]).toBeTruthy();
     expect(opIds[1]).toBeTruthy();
     expect(opIds[0]).not.toBe(opIds[1]);
+    // Every write is a compare-and-set against the revision the immediately
+    // preceding read returned. Without it a write would clobber whatever a
+    // concurrent writer put there between the read and the write, which is the
+    // single most important data-safety guard in the pass. The retry must carry
+    // the SECOND read's revision, not the first: replaying the stale one would
+    // conflict forever.
+    expect(client.__setCalls.map((args) => args.if_version)).toEqual([1, 2]);
   });
 
   it('skips and reports after two conflicts', async () => {
@@ -61,6 +68,8 @@ describe('applyOne', () => {
     expect(h.records.filter((r) => r.kind === 'applied')).toHaveLength(0);
     expect(h.records.some((r) => r.kind === 'skip' && r.reason === 'conflict-twice')).toBe(true);
     expect(h.skipped).toHaveLength(1);
+    // Both doomed attempts still guarded, each against its own fresh read.
+    expect(client.__setCalls.map((args) => args.if_version)).toEqual([1, 2]);
   });
 
   it('skips when the fresh read shows the entry no longer qualifies', async () => {
@@ -109,5 +118,9 @@ describe('applyOne', () => {
       expect(intents[i].operation_id).toBe(setOpIds[i]);
     }
     expect(setOpIds[0]).not.toBe(setOpIds[1]);
+    // The guarded revision must match the read that produced the preimage
+    // logged alongside it, attempt for attempt.
+    expect(client.__setCalls.map((args) => args.if_version)).toEqual([1, 2]);
+    expect(h.records.filter((r) => r.kind === 'applied')[0].prior_revision).toBe(2);
   });
 });

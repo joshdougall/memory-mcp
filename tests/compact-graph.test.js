@@ -30,14 +30,25 @@ describe('stripManagedBlock', () => {
     expect(stripManagedBlock(body)).toBe(`mid\n${BACKLINK_START}\ny\n${BACKLINK_END}`);
   });
 
-  it('returns the body unchanged when only a start marker is present', () => {
+  it('removes a lone start marker when no complete block is present', () => {
     const body = `text\n${BACKLINK_START}\nmore text`;
-    expect(stripManagedBlock(body)).toBe(body);
+    expect(stripManagedBlock(body)).toBe('text\nmore text');
   });
 
-  it('returns the body unchanged when only an end marker is present', () => {
+  // Previously asserted that the body came back unchanged, which certified the
+  // orphan-end bug as correct: applyBacklinks then appended a fresh block after
+  // the surviving marker on every run and the entry grew forever.
+  it('removes a lone end marker when no complete block is present', () => {
     const body = `text\n${BACKLINK_END}\nmore text`;
-    expect(stripManagedBlock(body)).toBe(body);
+    expect(stripManagedBlock(body)).toBe('text\nmore text');
+  });
+
+  it('removes every stray marker when the body holds no complete block', () => {
+    const body = `a\n${BACKLINK_END}\nb\n${BACKLINK_START}\nc`;
+    const out = stripManagedBlock(body);
+    expect(out).toBe('a\nb\nc');
+    expect(out).not.toContain(BACKLINK_START);
+    expect(out).not.toContain(BACKLINK_END);
   });
 
   it('removes only the complete block when a dangling start marker precedes it', () => {
@@ -72,6 +83,18 @@ describe('parseLinks', () => {
   it('extracts links from a body with only an end marker (no start marker)', () => {
     const body = `[[should-be-extracted]]\n${BACKLINK_END}`;
     expect(parseLinks(body)).toEqual(['should-be-extracted']);
+  });
+
+  // The invariant the orphan-end bug broke: once a block has been appended
+  // after a stray end marker, its `- [[id]]` lines are machine written and must
+  // never be read back as outbound citations from this entry.
+  it('reads no citations from block text that follows an orphan end marker', () => {
+    const body = `plain\n${BACKLINK_END}\n${BACKLINK_START}\n## Referenced by\n- [[a]]\n- [[b]]\n${BACKLINK_END}`;
+    expect(parseLinks(body)).toEqual([]);
+  });
+
+  it('does not capture a link target across a newline', () => {
+    expect(parseLinks('[[unclosed\nnext line [[real]]')).toEqual(['real']);
   });
 });
 
