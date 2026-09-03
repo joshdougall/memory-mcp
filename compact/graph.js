@@ -21,7 +21,23 @@ export const BACKLINK_END = '<!-- compaction:backlinks:end -->';
 
 const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
-const LIST_ITEM_RE = /^([ \t]*)([-+*]|\d{1,9}[.)])([ \t]*)/;
+// A genuine list item marker is followed by at least one space or tab and
+// then non-whitespace content: `-`, `+`, `*` or digits plus `.`/`)` alone, or
+// followed only by more whitespace, is not a list item (no content to hold a
+// continuation indent against). The lookahead enforces the content half; the
+// required `[ \t]+` enforces the whitespace half.
+const LIST_ITEM_RE = /^([ \t]*)([-+*]|\d{1,9}[.)])([ \t]+)(?=\S)/;
+// A thematic break is three or more of the same `-`, `*` or `_`, optionally
+// separated by spaces or tabs, and nothing else on the line. This is checked
+// before LIST_ITEM_RE because a spaced-out break like `- - -` also satisfies
+// the bullet grammar above (marker, whitespace, then non-whitespace content),
+// so the break reading has to take priority explicitly rather than fall out
+// of the bullet regex on its own.
+const THEMATIC_BREAK_RE = /^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+// A setext heading underline is a line of only `=` characters or only `-`
+// characters (any count). Also checked ahead of LIST_ITEM_RE so a lone `-`
+// or `--` underline is never misread as an empty-content list marker.
+const SETEXT_UNDERLINE_RE = /^[ \t]*(=+|-+)[ \t]*$/;
 const BLANK_RE = /^[ \t]*$/;
 const TAB_STOP = 4;
 const INDENT_CODE = 4;
@@ -243,7 +259,8 @@ function scan(body) {
       continue;
     }
 
-    const item = LIST_ITEM_RE.exec(line);
+    const item = !THEMATIC_BREAK_RE.test(line) && !SETEXT_UNDERLINE_RE.test(line)
+      && LIST_ITEM_RE.exec(line);
     if (item) {
       const markerEnd = columnWidth(item[1] + item[2]);
       const gap = columnWidth(item[1] + item[2] + item[3]) - markerEnd;
@@ -391,10 +408,14 @@ export function parseLinks(body) {
   const excluded = mergeRanges(code, pairMarkers(markers).blocks);
   const seen = new Set();
   const out = [];
-  // The character class excludes newlines as well as `]`: an unmatched `[[`
-  // would otherwise run across lines and capture a multi-line target, which
-  // would mint a stub with a garbage multi-line id.
-  const re = /\[\[([^\]\n]+)\]\]/g;
+  // The character class excludes both line terminator characters, `\n` and
+  // `\r`, as well as `]`. This file treats a bare `\r` as a line terminator on
+  // its own (see the note on `scan`), so the target class must reject it too:
+  // otherwise an unmatched `[[` would run across a bare-CR line boundary and
+  // capture a multi-line target, which would mint a stub with a garbage
+  // carriage-return-bearing id and, with no line terminator left to bound the
+  // backtracking, turn a body of dangling `[[` markers quadratic.
+  const re = /\[\[([^\]\n\r]+)\]\]/g;
   let cursor = 0;
   const take = (from, to) => {
     if (to <= from) return;

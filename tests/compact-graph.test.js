@@ -400,3 +400,134 @@ describe('scanner properties', () => {
     expect(stripManagedBlock(body)).toBe(body);
   });
 });
+
+// ---------------------------------------------------------------------------
+// F1 and F2. The target class excluded `\n` but not a bare `\r`, even though
+// the rest of this file treats a bare `\r` as a line terminator on its own.
+// An unmatched `[[` could run across that boundary and, with nothing to bound
+// the backtracking, do so in quadratic time.
+// ---------------------------------------------------------------------------
+
+describe('F1: bare CR in a wikilink target', () => {
+  it('does not swallow a genuine citation across a bare CR after a dangling [[', () => {
+    // The buggy class read this as one target, "b\rsee [[real-entry", losing
+    // the genuine citation and carrying a raw \r into a would-be stub id.
+    expect(parseLinks('a [[ b\rsee [[real-entry]]')).toEqual(['real-entry']);
+  });
+
+  it('never returns a target containing a carriage return or newline', () => {
+    const bodies = [
+      'a [[ b\rsee [[real-entry]]',
+      '[[x\ry]] [[a\nb]] [[clean]]',
+      'prefix [[one\r\ntwo]] [[also-clean]]',
+    ];
+    for (const body of bodies) {
+      for (const target of parseLinks(body)) {
+        expect(target).not.toMatch(/[\r\n]/);
+      }
+    }
+  });
+});
+
+describe('F2: quadratic backtracking on a dangling [[ before a bare CR', () => {
+  // Defect verified by the reviewer, reproduced with the literal input that
+  // exposes it: '[[\r'.repeat(n), with no closing ]] anywhere in the body, so
+  // every dangling `[[` fails to match and, with no \n to bound the
+  // backtrack, each failure re-scans to the end of the body. Measured on the
+  // pre-fix code: 85ms at 8k, 1291ms at 32k, 5128ms at 64k, 20640ms at 128k, a
+  // 16x cost for a 4x input, versus low milliseconds at 128k for the fix.
+  // (A closing ]] anywhere in the body, e.g. a trailing "tail [[keep]]",
+  // gives the very first dangling `[[` one big greedy match all the way to
+  // it, which finishes in one pass regardless of the bug: it would not
+  // reproduce the quadratic behaviour, so it is deliberately not used here.)
+  it('parses 128k repeats of dangling [[\\r in linear, not quadratic, time', () => {
+    const n = 128000;
+    const body = '[[\r'.repeat(n);
+    const t0 = performance.now();
+    expect(parseLinks(body)).toEqual([]);
+    const ms = performance.now() - t0;
+    // The quadratic implementation took over 20s at this size; a linear scan
+    // finishes in low milliseconds. 3s leaves comfortable headroom for a
+    // loaded CI box while still failing hard on any reintroduced backtrack.
+    expect(ms).toBeLessThan(3000);
+  });
+
+  it('scales linearly across 8k, 32k and 128k repeats of [[\\r', () => {
+    // One warm-up call outside the measured sizes so JIT compilation cost
+    // lands here rather than skewing the smallest, otherwise-tiny timing.
+    parseLinks('[[\r'.repeat(1000));
+    const timings = [8000, 32000, 128000].map((n) => {
+      const body = '[[\r'.repeat(n);
+      const t0 = performance.now();
+      expect(parseLinks(body)).toEqual([]);
+      return performance.now() - t0;
+    });
+    // Quadratic growth would be ~16x from 32k to 128k (4x input, squared).
+    // Linear growth stays well under that. A floor on the baseline and a
+    // generous multiple keep this from flaking on a noisy box while still
+    // catching the O(n^2) shape.
+    expect(timings[2]).toBeLessThan(Math.max(timings[1], 2) * 10);
+  });
+
+  it('still reads the genuine citation that follows the pathological run, in linear time', () => {
+    // The same shape with real content after it: proves the fix is not just
+    // fast but still correct once a closing ]] exists further in the body.
+    const n = 128000;
+    const body = '[[\r'.repeat(n) + 'tail [[keep]]';
+    const t0 = performance.now();
+    expect(parseLinks(body)).toEqual(['keep']);
+    expect(performance.now() - t0).toBeLessThan(3000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3. LIST_ITEM_RE matched thematic breaks and setext underlines as list
+// items, which raised the indented-code threshold and let a code sample under
+// a `---` divider be read as prose.
+// ---------------------------------------------------------------------------
+
+describe('F3: thematic breaks and setext underlines are not list items', () => {
+  it('does not let a --- divider raise the indented-code threshold, hiding a real code sample', () => {
+    const withDivider = 'intro\n\n---\n\n    example [[NOT-A-CITATION]]\n\nprose [[real]]';
+    expect(parseLinks(withDivider)).toEqual(['real']);
+    // Confirms the --- itself is the cause: removing it changes nothing here,
+    // since the indented block is excluded either way once the threshold is
+    // no longer raised.
+    const withoutDivider = 'intro\n\n    example [[NOT-A-CITATION]]\n\nprose [[real]]';
+    expect(parseLinks(withoutDivider)).toEqual(['real']);
+  });
+
+  it('treats a *** divider the same as a --- divider', () => {
+    const body = 'intro\n\n***\n\n    example [[NOT-A-CITATION]]\n\nprose [[real]]';
+    expect(parseLinks(body)).toEqual(['real']);
+  });
+
+  it('treats a spaced-out divider (- - -) as a thematic break, not a list item', () => {
+    const body = 'intro\n\n- - -\n\n    example [[NOT-A-CITATION]]\n\nprose [[real]]';
+    expect(parseLinks(body)).toEqual(['real']);
+  });
+
+  it('treats a setext underline (===) the same way', () => {
+    const body = 'intro\n\n===\n\n    example [[NOT-A-CITATION]]\n\nprose [[real]]';
+    expect(parseLinks(body)).toEqual(['real']);
+  });
+
+  it('still reads a genuine dash bullet list item as a list item', () => {
+    // Continuation paragraph four columns in after a blank line: read as
+    // prose, not code, because it sits inside the list item's own indent.
+    expect(parseLinks('- item\n\n    continued [[keep]]')).toEqual(['keep']);
+  });
+
+  it('still reads a genuine asterisk bullet list item as a list item', () => {
+    expect(parseLinks('* item\n\n   continued [[keep]]')).toEqual(['keep']);
+  });
+
+  it('treats a bare dash as no list item, so it does not raise the indented-code threshold', () => {
+    // A genuine list item raises the indented-code threshold to marker width
+    // plus 4. A bare "-" with no following content must not do that: there is
+    // no content to hang a continuation indent against, so the threshold here
+    // stays at the plain baseline of 4 and a 5-space indent is still code.
+    const body = '-\n\n     example [[should-be-code]]\n\nprose [[keep]]';
+    expect(parseLinks(body)).toEqual(['keep']);
+  });
+});
