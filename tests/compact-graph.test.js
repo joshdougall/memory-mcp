@@ -25,9 +25,28 @@ describe('stripManagedBlock', () => {
     expect(stripManagedBlock(`${BACKLINK_START}\nx\n${BACKLINK_END}`)).toBe('');
   });
 
-  it('removes only the first block when markers repeat', () => {
+  // Previously asserted that only the FIRST block was removed, which certified
+  // the duplicate-block bug as correct: parseLinks then read the second block's
+  // machine written `- [[id]]` lines as real outbound citations, and
+  // applyBacklinks stabilised with two blocks instead of one.
+  it('removes every complete block when markers repeat', () => {
     const body = `${BACKLINK_START}\nx\n${BACKLINK_END}\nmid\n${BACKLINK_START}\ny\n${BACKLINK_END}`;
-    expect(stripManagedBlock(body)).toBe(`mid\n${BACKLINK_START}\ny\n${BACKLINK_END}`);
+    const out = stripManagedBlock(body);
+    expect(out).toBe('mid');
+    expect(out).not.toContain(BACKLINK_START);
+    expect(out).not.toContain(BACKLINK_END);
+  });
+
+  it('reads no citations out of a second complete block', () => {
+    const body = `real [[keep]]\n${BACKLINK_START}\n- [[gen-a]]\n${BACKLINK_END}`
+      + `\n${BACKLINK_START}\n- [[gen-b]]\n${BACKLINK_END}`;
+    expect(parseLinks(body)).toEqual(['keep']);
+  });
+
+  it('reaches a fixed point in one application when blocks repeat', () => {
+    const body = `${BACKLINK_START}\nx\n${BACKLINK_END}\nmid\n${BACKLINK_START}\ny\n${BACKLINK_END}`;
+    const once = stripManagedBlock(body);
+    expect(stripManagedBlock(once)).toBe(once);
   });
 
   it('removes a lone start marker when no complete block is present', () => {
@@ -51,9 +70,16 @@ describe('stripManagedBlock', () => {
     expect(out).not.toContain(BACKLINK_END);
   });
 
-  it('removes only the complete block when a dangling start marker precedes it', () => {
+  // The END pairs with the NEAREST preceding start, so the text between the two
+  // starts is never swallowed. The earlier start is a stray and only its own
+  // bytes go: leaving it behind is what made applyBacklinks append a second
+  // block on the next run.
+  it('removes the complete block and the dangling start that precedes it, keeping the text between', () => {
     const body = `${BACKLINK_START}\nstray\n${BACKLINK_START}\nx\n${BACKLINK_END}`;
-    expect(stripManagedBlock(body)).toBe(`${BACKLINK_START}\nstray`);
+    const out = stripManagedBlock(body);
+    expect(out).toBe('stray');
+    expect(out).not.toContain(BACKLINK_START);
+    expect(out).not.toContain(BACKLINK_END);
   });
 });
 
@@ -213,5 +239,164 @@ describe('buildGraph', () => {
   it('ignores an entry citing itself', () => {
     const g = buildGraph([entry('a', 'see [[a]]')]);
     expect(g.inbound.has('a')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The five defects the single-pass scanner was written to close. Each one is
+// reproducible against the previous implementation.
+// ---------------------------------------------------------------------------
+
+const fence = (...lines) => ['```', ...lines, '```'].join('\n');
+
+describe('markers inside code are inert', () => {
+  // Defect 2. The old strip took the FIRST complete pair of markers it found,
+  // which in a body that documents the block format is the quoted sample. The
+  // user's documentation was deleted, the real block survived, and its machine
+  // written `- [[id]]` lines then read back as outbound citations.
+  it('removes the real block and preserves a complete block quoted in a fenced sample', () => {
+    const sample = fence(BACKLINK_START, '## Referenced by', '- [[example]]', BACKLINK_END);
+    const body = `docs\n${sample}\nprose [[cited]]\n`
+      + `${BACKLINK_START}\n## Referenced by\n- [[a]]\n- [[b]]\n${BACKLINK_END}`;
+    expect(stripManagedBlock(body)).toBe(`docs\n${sample}\nprose [[cited]]`);
+  });
+
+  it('reads citations from prose only, not from a quoted sample or the real block', () => {
+    const sample = fence(BACKLINK_START, '- [[example]]', BACKLINK_END);
+    const body = `docs\n${sample}\nprose [[cited]]\n`
+      + `${BACKLINK_START}\n- [[a]]\n${BACKLINK_END}`;
+    expect(parseLinks(body)).toEqual(['cited']);
+  });
+
+  it('preserves a marker quoted in an inline code span', () => {
+    const body = `the block opens with \`${BACKLINK_START}\` and closes with \`${BACKLINK_END}\``;
+    expect(stripManagedBlock(body)).toBe(body);
+  });
+
+  it('preserves markers inside an indented code block', () => {
+    const body = `docs\n\n    ${BACKLINK_START}\n    ${BACKLINK_END}\n\nafter`;
+    expect(stripManagedBlock(body)).toBe(body);
+  });
+
+  it('still removes a real block that follows a quoted one', () => {
+    const body = `\`${BACKLINK_START}\`\n${BACKLINK_START}\nx\n${BACKLINK_END}`;
+    expect(stripManagedBlock(body)).toBe(`\`${BACKLINK_START}\``);
+  });
+});
+
+describe('carriage returns', () => {
+  // Defect 3. Splitting on \n left the \r on the closing fence, the close test
+  // rejected it, and the fence swallowed the rest of the body. A real citation
+  // hidden that way makes a cited entry look uncited and starts its 30 day
+  // retirement with no human flag.
+  it('closes a CRLF fence and reads the citation that follows it', () => {
+    const body = 'intro\r\n```\r\n[[hidden]]\r\n```\r\n[[real-after]]';
+    expect(parseLinks(body)).toEqual(['real-after']);
+  });
+
+  it('closes a bare CR fence and reads the citation that follows it', () => {
+    const body = 'intro\r```\r[[hidden]]\r```\r[[real-after]]';
+    expect(parseLinks(body)).toEqual(['real-after']);
+  });
+
+  it('strips a managed block written with CRLF separators', () => {
+    const body = `a\r\n${BACKLINK_START}\r\n- [[x]]\r\n${BACKLINK_END}`;
+    expect(stripManagedBlock(body)).toBe('a\r');
+  });
+
+  it('round trips a CRLF body byte exactly', () => {
+    // What applyBacklinks does: strip, then join the bare body to a fresh block
+    // with a single \n. The \r stays on the bare body, so run two reproduces
+    // run one byte for byte and the entry is never rewritten.
+    const block = `${BACKLINK_START}\n## Referenced by\n- [[a]]\n- [[b]]\n${BACKLINK_END}`;
+    const applied = `a\r\n${block}`;
+    expect(`${stripManagedBlock(applied)}\n${block}`).toBe(applied);
+  });
+
+  it('does not read a citation out of an unclosed CRLF fence', () => {
+    expect(parseLinks('[[keep]]\r\n```\r\n[[hidden]]\r\nmore [[also-hidden]]')).toEqual(['keep']);
+  });
+});
+
+describe('indented code', () => {
+  // Defect 4. Four-space indented code was parsed for citations, which minted
+  // stubs for ids that only ever existed inside a code sample.
+  it('ignores wikilinks in a four-space indented block', () => {
+    expect(parseLinks('prose [[keep]]\n\n    see [[indented]]\n\nafter')).toEqual(['keep']);
+  });
+
+  it('ignores wikilinks in a tab indented block', () => {
+    expect(parseLinks('prose [[keep]]\n\n\tsee [[indented]]\n\nafter')).toEqual(['keep']);
+  });
+
+  it('ignores an indented block that ends the body', () => {
+    expect(parseLinks('prose [[keep]]\n\n    [[indented]]')).toEqual(['keep']);
+  });
+
+  // An indented chunk cannot interrupt a paragraph, so this is prose, not code.
+  it('still reads a wikilink from an indented paragraph continuation', () => {
+    expect(parseLinks('prose\n    continued [[keep]]')).toEqual(['keep']);
+  });
+
+  // A continuation paragraph of a list item sits four or more columns in after
+  // a blank line. Reading it as code would silently drop a real citation.
+  it('still reads a wikilink from a continuation paragraph of a list item', () => {
+    expect(parseLinks('- item\n\n    continued [[keep]]')).toEqual(['keep']);
+  });
+
+  it('reads code indented past a list item as code', () => {
+    expect(parseLinks('- item\n\n        [[sample]]\n\nprose [[keep]]')).toEqual(['keep']);
+  });
+});
+
+describe('pathological marker input', () => {
+  // Defect 5. Each stray marker used to trigger another full search and string
+  // copy. Graph construction runs synchronously between deadline checks, so a
+  // large enough malformed body could run past the 600s budget and be killed by
+  // systemd, bypassing the script's classified exit code.
+  it('strips 128k stray markers in linear time', () => {
+    const body = `${BACKLINK_START}\n`.repeat(128000) + 'tail [[keep]]';
+    const t0 = performance.now();
+    const out = stripManagedBlock(body);
+    const ms = performance.now() - t0;
+    expect(out).toBe('tail [[keep]]');
+    // The quadratic implementation needed more than 14s for this input.
+    expect(ms).toBeLessThan(3000);
+  });
+
+  it('parses links out of a body of 128k stray markers in linear time', () => {
+    const body = `${BACKLINK_END}\n`.repeat(128000) + 'tail [[keep]]';
+    const t0 = performance.now();
+    expect(parseLinks(body)).toEqual(['keep']);
+    expect(performance.now() - t0).toBeLessThan(3000);
+  });
+});
+
+describe('scanner properties', () => {
+  it('never removes text that sits inside a code region', () => {
+    const body = `a\n${fence(BACKLINK_START, 'keep me', BACKLINK_END)}\n`
+      + `b \`${BACKLINK_END}\` c\n${BACKLINK_START}\nz\n${BACKLINK_END}`;
+    const out = stripManagedBlock(body);
+    expect(out).toContain('keep me');
+    expect(out).toContain(`\`${BACKLINK_END}\``);
+    expect(out).toContain(fence(BACKLINK_START, 'keep me', BACKLINK_END));
+    expect(out).not.toContain('\nz\n');
+  });
+
+  it('is a fixed point after one application for every marker arrangement', () => {
+    const parts = ['x', BACKLINK_START, BACKLINK_END, '`' + BACKLINK_START + '`', '[[l]]'];
+    for (const a of parts) {
+      for (const b of parts) {
+        for (const c of parts) {
+          const once = stripManagedBlock(`${a}\n${b}\n${c}`);
+          expect(stripManagedBlock(once)).toBe(once);
+        }
+      }
+    }
+  });
+
+  it('leaves a body with no markers untouched', () => {
+    const body = 'plain [[a]]\n\n    indented\n\n```\nfenced\n```\n';
+    expect(stripManagedBlock(body)).toBe(body);
   });
 });
