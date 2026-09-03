@@ -94,7 +94,7 @@ describe('planStubs', () => {
     expect(stub.body).not.toContain(BACKLINK_START);
   });
 
-  it('records the citer count without linking to them', () => {
+  it('records the citer count in the prose', () => {
     const g = buildGraph([entry('a', { body: '[[ghost]]' }), entry('b', { body: '[[ghost]]' })]);
     expect(planStubs(g)[0].body).toContain('2');
   });
@@ -104,5 +104,58 @@ describe('planStubs', () => {
     const asEntry = entry(stub.id, { body: stub.body, type: stub.type, tags: stub.tags });
     const next = planEntry(asEntry, buildGraph([asEntry, entry('a', { body: '[[ghost]]' })]));
     expect(next.write).toBeNull();
+  });
+
+  // A dangling target can be cited by two or more entries, and a stub is an
+  // ordinary entry from the next census onward. It has to be built directly in
+  // whatever terminal form ordinary planning would leave it in, using the same
+  // threshold, or the very next run is a write on an otherwise unchanged store.
+  describe('threshold parity with ordinary backlink planning', () => {
+    it('creates a stub with two citers WITH a managed block listing both, and replanning it agrees', () => {
+      const citerEntries = [entry('a', { body: '[[ghost]]' }), entry('b', { body: '[[ghost]]' })];
+      const [stub] = planStubs(buildGraph(citerEntries));
+      expect(stub.body).toContain(BACKLINK_START);
+      expect(stub.body).toContain('[[a]]');
+      expect(stub.body).toContain('[[b]]');
+
+      const asEntry = entry(stub.id, { body: stub.body, type: stub.type, tags: stub.tags });
+      const next = planEntry(asEntry, buildGraph([asEntry, ...citerEntries]));
+      expect(next.write).toBeNull();
+    });
+
+    it('creates a stub with one citer WITHOUT a managed block, and replanning it agrees', () => {
+      const citerEntries = [entry('a', { body: '[[ghost]]' })];
+      const [stub] = planStubs(buildGraph(citerEntries));
+      expect(stub.body).not.toContain(BACKLINK_START);
+
+      const asEntry = entry(stub.id, { body: stub.body, type: stub.type, tags: stub.tags });
+      const next = planEntry(asEntry, buildGraph([asEntry, ...citerEntries]));
+      expect(next.write).toBeNull();
+    });
+
+    it('creates a stub with three citers WITH a managed block listing all three, and replanning it agrees', () => {
+      const citerEntries = [
+        entry('a', { body: '[[ghost]]' }),
+        entry('b', { body: '[[ghost]]' }),
+        entry('c', { body: '[[ghost]]' }),
+      ];
+      const [stub] = planStubs(buildGraph(citerEntries));
+      expect(stub.body).toContain(BACKLINK_START);
+      expect(stub.body).toContain('[[a]]');
+      expect(stub.body).toContain('[[b]]');
+      expect(stub.body).toContain('[[c]]');
+
+      const asEntry = entry(stub.id, { body: stub.body, type: stub.type, tags: stub.tags });
+      const next = planEntry(asEntry, buildGraph([asEntry, ...citerEntries]));
+      expect(next.write).toBeNull();
+    });
+
+    it('never reads its own generated block back as outbound citations, at any citer count', () => {
+      for (const ids of [['a'], ['a', 'b'], ['a', 'b', 'c']]) {
+        const citerEntries = ids.map((id) => entry(id, { body: '[[ghost]]' }));
+        const [stub] = planStubs(buildGraph(citerEntries));
+        expect(parseLinks(stub.body)).toEqual([]);
+      }
+    });
   });
 });

@@ -125,17 +125,28 @@ export async function run({
     let landed = 0;
     try {
       landed = log.writesLanded();
-      log.record('end', { code, counts: log.counts(), writes_landed: landed });
     } catch {
       // An unwritable log is a local failure, not a success. Say so rather than
       // returning 0 for a run whose record does not exist.
       if (code === EXIT.OK) code = EXIT.LOCAL;
     }
-    log.close();
 
     // 4 outranks every other non-zero code: an incomplete run that changed the
-    // store is a more serious fact than the reason it stopped.
-    if (landed > 0 && code !== EXIT.OK) return EXIT.PARTIAL;
+    // store is a more serious fact than the reason it stopped. Resolved BEFORE
+    // the end record is written, so the record and the code `run()` returns
+    // always agree: an operator reading the log after an alert must never see
+    // a code that contradicts the one that triggered it.
+    if (landed > 0 && code !== EXIT.OK) code = EXIT.PARTIAL;
+
+    try {
+      log.record('end', { code, counts: log.counts(), writes_landed: landed });
+    } catch {
+      // Same rule as above: an unwritable log is a local failure, not a
+      // success, unless the run already reports something more serious.
+      if (code === EXIT.OK) code = EXIT.LOCAL;
+    }
+    log.close();
+
     return code;
   } catch {
     try { log?.close(); } catch { /* best effort */ }

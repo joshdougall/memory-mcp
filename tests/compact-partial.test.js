@@ -76,6 +76,14 @@ describe('exit code precedence', () => {
     const end = lines.filter((r) => r.kind === 'end').at(-1);
     expect(end.writes_landed).toBeGreaterThan(0);
 
+    // The log is the forensic record for an unattended job: its own `end`
+    // record has to agree with the code the process actually exits with, not
+    // with the plain reason the run stopped before the precedence rule
+    // upgraded it to PARTIAL. An operator reading the log after an alert must
+    // never see a code that contradicts the one that triggered the alert.
+    expect(end.code).toBe(code);
+    expect(end.code).toBe(EXIT.PARTIAL);
+
     const after = await census(client);
     const changed = after.filter((r) => (r.id === a || r.id === b) && r.project === '');
     expect(changed).toHaveLength(1);

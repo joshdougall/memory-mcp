@@ -49,22 +49,28 @@ export function planEntry(entry, graph) {
 }
 
 export function planStubs(graph) {
-  return [...graph.dangling.entries()].map(([id, citers]) => ({
-    id,
-    title: id,
-    // NO wikilinks and NO managed block. A threshold-1 block here would be
-    // removed by the next run, which evaluates the stub as an ordinary entry at
-    // threshold 2, so every stub would churn on alternate runs. Who cited it is
-    // in the run log and the report; if it reaches two citers the ordinary
-    // backlink pass gives it a block like anything else.
-    body: [
+  return [...graph.dangling.entries()].map(([id, citers]) => {
+    const prose = [
       'Created by the memory compaction pass to resolve a dangling link.',
       `Cited by ${citers.size} entr${citers.size === 1 ? 'y' : 'ies'} at creation time.`,
       'No content yet.',
-    ].join('\n'),
-    type: 'entity',
-    tags: ['stub'],
-    source: 'memory-compaction',
-    project: '',
-  }));
+    ].join('\n');
+    return {
+      id,
+      title: id,
+      // Built directly in its terminal form, using the SAME threshold ordinary
+      // planning applies. A stub with two or more citers is created WITH its
+      // managed block; a stub with one citer is created WITHOUT one. Either
+      // way the next census evaluates this stub as an ordinary entry and
+      // agrees with what is already there, so it plans no write. A
+      // threshold-1 block here would be wrong in the other direction: the next
+      // run evaluates the stub at threshold 2, removes the block, and every
+      // single-citer stub churns on alternate runs forever.
+      body: applyBacklinks(prose, [...citers]),
+      type: 'entity',
+      tags: ['stub'],
+      source: 'memory-compaction',
+      project: '',
+    };
+  });
 }
