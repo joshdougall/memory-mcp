@@ -8,7 +8,41 @@ import Redis from 'ioredis';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, '..', 'server.js');
-const VALKEY_URL = process.env.VALKEY_URL || 'redis://127.0.0.1:6379';
+const VALKEY_URL = process.env.VALKEY_URL || 'redis://127.0.0.1:6379/10';
+
+// This file spawns a real server and writes real keys, then deletes them. It
+// must never do that to db 0, which is where a real store lives. Fail closed
+// rather than flush somebody's data. Db 10 is this file's own database: the
+// semantic suites hold 5 through 9 and the compaction suites hold 11 to 15.
+const TEST_DB = Number(new URL(VALKEY_URL).pathname.slice(1) || 0);
+if (!TEST_DB) {
+  throw new Error(
+    `tests/server.test.js refuses to run against Valkey db 0 (VALKEY_URL=${VALKEY_URL}). `
+    + 'Point VALKEY_URL at a dedicated test database, for example '
+    + 'redis://127.0.0.1:6379/10.',
+  );
+}
+
+// Without this the file accumulates about 160 keys per run, permanently: it
+// creates entries under mem:, memver:, memrev:, memop: and the tag:, type: and
+// project: index sets, plus memchunk:/memchunks: once write-time indexing
+// landed, and removes none of them.
+async function flushTestDb() {
+  const r = new Redis(VALKEY_URL, { lazyConnect: false });
+  try {
+    if (r.options.db !== TEST_DB) {
+      throw new Error(
+        `refusing to flush: connected to db ${r.options.db}, expected ${TEST_DB}`,
+      );
+    }
+    await r.flushdb();
+  } finally {
+    await r.quit();
+  }
+}
+
+beforeAll(flushTestDb);
+afterAll(flushTestDb);
 
 // ============================================================================
 // HELPERS
