@@ -6,10 +6,12 @@ import {
 } from '../semantic/chunkstore.js';
 import { DIMS, MODEL_ID } from '../semantic/embedder.js';
 
-// Tests must NEVER touch db 0: that is the live memory store with ~842 real
-// entries. Db 7 is the dedicated test database for this file. Fail closed
-// rather than proceed on anything that does not prove which db we are on.
-const TEST_DB = 7;
+// Tests must NEVER touch db 0. Locally that is where tests/server.test.js
+// writes without ever flushing, and it has broken real assertions twice.
+// Db 9 is this file's dedicated database, assigned by the plan so that test
+// files running in parallel never flush each other. Fail closed rather than
+// proceed on anything that does not prove which db we are on.
+const TEST_DB = 9;
 
 let redis;
 
