@@ -8,6 +8,10 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import Redis from 'ioredis';
+import { indexEntry } from './semantic/index.js';
+import { getChunks } from './semantic/chunkstore.js';
+import { embedQuery } from './semantic/embedder.js';
+import { bestChunk, keywordScore, blend } from './semantic/rank.js';
 import {
   Registry,
   Gauge,
@@ -432,12 +436,12 @@ function buildMcpServer() {
 
   server.tool(
     'memory_search',
-    'Search memories by tag intersection, type, project, or text substring. Returns entries sorted by hits desc then updated desc.',
+    'Search memories by tag intersection, type, or project, optionally ranked by a query. Tag, type and project are filters. The query is not a filter: it scores entries by meaning and by keyword, and results come back most relevant first. With no query, entries are sorted by hits desc then updated desc.',
     {
       tags: z.array(z.string()).optional().describe('Tag names to intersect (all must match)'),
       type: z.string().optional().describe('Filter by memory type (pattern, decision, reference, feedback, incident, project, entity, state)'),
       project: z.string().optional().describe('Filter by project name (empty string for cross-project)'),
-      query: z.string().optional().describe('Substring to match against title and body'),
+      query: z.string().optional().describe('Natural language query. Ranks entries by semantic similarity blended with a keyword match against title and body. Omit to list without ranking.'),
       limit: z.number().int().positive().optional().default(20).describe('Maximum results to return'),
     },
     async ({ tags, type, project, query, limit }) => {
@@ -479,32 +483,69 @@ function buildMcpServer() {
           candidateKeys = new Set(allKeys);
         }
 
+        // The query is embedded once, not per candidate. A failure here is a
+        // worse answer, not a failed one: scoring falls back to keywords alone
+        // and the response says so.
+        let queryVector = null;
+        let degraded = null;
+        if (query) {
+          try {
+            queryVector = await embedQuery(query);
+          } catch (err) {
+            degraded = `semantic search unavailable: ${err.message}`;
+          }
+        }
+
         const results = [];
         for (const key of candidateKeys) {
           const raw = await redis.hgetall(key);
           if (!raw || !raw.title) continue;
-
-          if (query) {
-            const q = query.toLowerCase();
-            if (!raw.title.toLowerCase().includes(q) && !(raw.body || '').toLowerCase().includes(q)) {
-              continue;
-            }
-          }
-
           const id = key.replace(/^mem:/, '');
-          results.push({ id, ...entryToObject(raw) });
+          const entry = { id, ...entryToObject(raw) };
+
+          if (!query) { results.push(entry); continue; }
+
+          const textScore = keywordScore(query, raw.title, raw.body);
+          let vectorScore = 0;
+          let best = null;
+          if (queryVector) {
+            // An entry with no stored chunks (written before this feature, or
+            // still waiting on the backfill) simply scores zero here rather
+            // than erroring.
+            best = bestChunk(queryVector, await getChunks(redis, id));
+            if (best) vectorScore = best.score;
+          }
+          if (textScore === 0 && vectorScore <= 0) continue;
+
+          entry.textScore = Number(textScore.toFixed(4));
+          entry.vectorScore = Number(vectorScore.toFixed(4));
+          entry.score = Number(blend(vectorScore, textScore).toFixed(4));
+          if (best) {
+            entry.excerpt = best.chunk.text;
+            entry.chunkRange = { start: best.chunk.start, end: best.chunk.end };
+          }
+          results.push(entry);
         }
 
-        results.sort((a, b) => {
-          if (b.hits !== a.hits) return b.hits - a.hits;
-          return (b.updated || '').localeCompare(a.updated || '');
-        });
+        if (query) {
+          // Relevance replaces the hits sort whenever there is something to be
+          // relevant to. With no query the old ordering is untouched.
+          results.sort((a, b) => b.score - a.score);
+        } else {
+          results.sort((a, b) => {
+            if (b.hits !== a.hits) return b.hits - a.hits;
+            return (b.updated || '').localeCompare(a.updated || '');
+          });
+        }
 
         const limited = results.slice(0, limit || 20);
         if (limited.length === 0) metricSearchEmptyTotal.inc();
 
+        const payload = { count: limited.length, results: limited };
+        if (degraded) payload.degraded = degraded;
+
         return {
-          content: [{ type: 'text', text: JSON.stringify({ count: limited.length, results: limited }, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
         };
       } finally {
         end();
@@ -585,6 +626,16 @@ function buildMcpServer() {
       }
 
       metricWriteTotal.inc();
+
+      // Indexing is best effort and deliberately after the write. indexEntry
+      // already swallows an embedder failure and marks the entry dirty for the
+      // backfill; this catch covers the rest, chiefly a Valkey failure inside
+      // putChunks. A stored memory must never be lost to a search-side problem.
+      try {
+        await indexEntry(redis, id, { title, body, ttl });
+      } catch (err) {
+        console.error(`[semantic] index failed for ${id}:`, err.message);
+      }
 
       const warning = await entryCountWarning();
 
