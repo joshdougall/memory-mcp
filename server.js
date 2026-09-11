@@ -9,7 +9,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import Redis from 'ioredis';
 import { indexEntry } from './semantic/index.js';
-import { getChunks } from './semantic/chunkstore.js';
+import { getChunks, deleteChunks } from './semantic/chunkstore.js';
 import { embedQuery } from './semantic/embedder.js';
 import { bestChunk, keywordScore, blend } from './semantic/rank.js';
 import {
@@ -505,7 +505,7 @@ function buildMcpServer() {
 
           if (!query) { results.push(entry); continue; }
 
-          const textScore = keywordScore(query, raw.title, raw.body);
+          const textScore = keywordScore(query, raw.title, raw.body, id);
           let vectorScore = 0;
           let best = null;
           if (queryVector) {
@@ -703,6 +703,16 @@ function buildMcpServer() {
       if (result.status === 'not_found') {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
+
+      // Chunks outlive the entry otherwise. Search cannot reach them, since
+      // candidates come from the entry keys and the indexes, so this is a
+      // storage leak rather than a wrong answer, but it is unbounded.
+      try {
+        await deleteChunks(redis, id);
+      } catch (err) {
+        console.error(`[semantic] chunk cleanup failed for ${id}:`, err.message);
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted', revision: result.revision }, null, 2) }] };
     }
   );
@@ -768,6 +778,23 @@ function buildMcpServer() {
         operation
       ));
       metricWriteTotal.inc();
+
+      // A rollback rewrites the body, so the chunks describe text the entry no
+      // longer has until it is re-indexed. Inline rather than markDirty: a
+      // dirty flag leaves a window in which search quotes an excerpt that is
+      // gone from the entry. Best effort, like memory_set, so an index failure
+      // cannot undo a rollback that already landed. 'KEEP' left whatever
+      // expiry the live entry had, so the ttl is read back rather than assumed.
+      try {
+        const liveTtl = parseInt(await redis.hget(`mem:${id}`, 'ttl') || '0', 10);
+        await indexEntry(redis, id, {
+          title: version.title || '',
+          body: version.body || '',
+          ttl: liveTtl > 0 ? liveTtl : undefined,
+        });
+      } catch (err) {
+        console.error(`[semantic] index failed for ${id} after rollback:`, err.message);
+      }
 
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation, restored_from: version.updated || 'unknown', revision: result.revision }, null, 2) }] };
     }

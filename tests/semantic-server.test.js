@@ -153,4 +153,83 @@ describe('hybrid memory_search', () => {
     expect(mixed.degraded).toBeUndefined();
     expect(mixed.results.some((r) => r.id === 'authority')).toBe(true);
   }, 120000);
+
+  it('orders a queried search by relevance, not by hits', async () => {
+    await call('memory_set', {
+      id: 'ranking-relevant', title: 'Rolling back a bad deployment',
+      body: 'When a release goes wrong in production, revert to the previous version and drain traffic away from the new pods.',
+      type: 'pattern', tags: ['ranking'],
+    });
+    await call('memory_set', {
+      id: 'ranking-popular', title: 'Sourdough starter feeding schedule',
+      body: 'Feed the starter equal parts flour and water each morning, and discard half of it before it doubles.',
+      type: 'pattern', tags: ['ranking'],
+    });
+    // hits move only through memory_get, so this is the only way to build the
+    // entry the old hits sort would have put first.
+    for (let i = 0; i < 5; i += 1) await call('memory_get', { id: 'ranking-popular' });
+
+    const out = await call('memory_search', {
+      tags: ['ranking'], query: 'how do I undo a broken production release', limit: 10,
+    });
+    expect(out.results).toHaveLength(2);
+    const [first, second] = out.results;
+    // The fixture only proves anything if the two orderings genuinely disagree:
+    // the entry that must come first is the one with fewer hits.
+    expect(first.hits).toBe(0);
+    expect(second.hits).toBeGreaterThan(first.hits);
+    expect(first.id).toBe('ranking-relevant');
+    expect(second.id).toBe('ranking-popular');
+    expect(first.score).toBeGreaterThan(second.score);
+    expect(first.vectorScore).toBeGreaterThan(second.vectorScore);
+  }, 120000);
+
+  it('re-indexes after a rollback so search cannot quote the abandoned body', async () => {
+    await call('memory_set', {
+      id: 'rolled', title: 'Api notes', body: 'postgres connection pooling settings for the api',
+      type: 'reference', tags: ['rollback'],
+    });
+    await call('memory_set', {
+      id: 'rolled', title: 'Api notes', body: 'nginx reverse proxy timeouts for the api',
+      type: 'reference', tags: ['rollback'],
+    });
+
+    const history = await call('memory_history', { id: 'rolled', limit: 10 });
+    const index = history.versions.findIndex((v) => (v.body || '').includes('postgres'));
+    expect(index).toBeGreaterThanOrEqual(0);
+    const rollback = await call('memory_rollback', { id: 'rolled', version_index: index });
+    expect(rollback.ok).toBe(true);
+
+    // Findable by the body it now has, quoting the body it now has.
+    const fresh = await call('memory_search', { query: 'database connection pool tuning', limit: 20 });
+    const freshHit = fresh.results.find((r) => r.id === 'rolled');
+    expect(freshHit).toBeDefined();
+    expect(freshHit.excerpt).toContain('postgres');
+
+    // And never quoting the body the rollback abandoned.
+    const stale = await call('memory_search', { query: 'nginx reverse proxy timeouts', limit: 20 });
+    const staleHit = stale.results.find((r) => r.id === 'rolled');
+    expect(staleHit?.excerpt || '').not.toContain('nginx');
+
+    // Nothing in the store still holds the abandoned text either.
+    const chunkKeys = await redis.smembers('memchunks:rolled');
+    expect(chunkKeys.length).toBeGreaterThan(0);
+    for (const key of chunkKeys) {
+      expect(await redis.hget(key, 'text')).not.toContain('nginx');
+    }
+  }, 120000);
+
+  it('leaves no chunk keys behind when an entry is deleted', async () => {
+    await call('memory_set', {
+      id: 'deletable', title: 'Temporary', body: 'a body long enough to produce at least one chunk vector',
+      type: 'reference', tags: ['deletable'],
+    });
+    expect((await redis.smembers('memchunks:deletable')).length).toBeGreaterThan(0);
+
+    const out = await call('memory_delete', { id: 'deletable' });
+    expect(out.ok).toBe(true);
+
+    expect(await redis.keys('memchunk:deletable:*')).toEqual([]);
+    expect(await redis.exists('memchunks:deletable')).toBe(0);
+  }, 120000);
 });

@@ -9,15 +9,35 @@ export function dot(a, b) {
   return s;
 }
 
-// Deliberately simple and bounded to [0, 1]. A title hit outranks a body hit
-// because titles in this store are unusually descriptive.
-export function keywordScore(query, title, body) {
+// Bounded to [0, 1], on a scale chosen so a literal lookup outranks vector
+// noise. At live-store scale this model returns roughly 0.36 cosine between
+// two unrelated English texts, so a keyword signal that topped out low enough
+// let unrelated entries outrank exact matches.
+//
+// The entry id is part of the haystack, and an exact id match is the top of
+// the scale. Agents look entries up by id, and before search went hybrid the
+// query was a substring filter, which made that work perfectly. keywordScore
+// never seeing the id was a regression against behaviour already in use.
+export const EXACT_ID_SCORE = 1;
+export const VERBATIM_SCORE = 0.8;
+export const TERM_SCORE = 0.5;
+
+export function keywordScore(query, title, body, id) {
   if (!query) return 0;
-  const q = query.toLowerCase();
-  const inTitle = (title || '').toLowerCase().includes(q);
-  const inBody = (body || '').toLowerCase().includes(q);
-  if (inTitle) return 1;
-  if (inBody) return 0.5;
+  const q = query.trim().toLowerCase();
+  if (!q) return 0;
+
+  if (q === (id || '').trim().toLowerCase() && q !== '') return EXACT_ID_SCORE;
+
+  const haystack = `${id || ''}\n${title || ''}\n${body || ''}`.toLowerCase();
+  if (haystack.includes(q)) return VERBATIM_SCORE;
+
+  // Every term has to land. Any-term matching would score almost the whole
+  // store on a natural language query, since common words appear everywhere,
+  // and a signal that fires for everything ranks nothing.
+  const terms = q.split(/\s+/).filter(Boolean);
+  if (terms.length > 1 && terms.every((t) => haystack.includes(t))) return TERM_SCORE;
+
   return 0;
 }
 
