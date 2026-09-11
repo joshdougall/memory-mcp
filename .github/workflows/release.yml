@@ -21,6 +21,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       valkey:
         image: valkey/valkey:9.0.3
@@ -40,7 +41,7 @@ jobs:
       - run: npm ci
       - run: npm test
         env:
-          VALKEY_URL: redis://127.0.0.1:6379
+          VALKEY_URL: redis://127.0.0.1:6379/10
 
   build:
     name: Build and push multi-arch image
