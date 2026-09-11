@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import Redis from 'ioredis';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { terminateChild } from './helpers/compact-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = 3131;
@@ -33,7 +34,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await client?.close?.(); await redis.flushdb(); await redis.quit();
-  proc?.kill('SIGTERM');
+  if (proc) await terminateChild(proc);
 });
 
 const call = async (name, args) => JSON.parse((await client.callTool({ name, arguments: args })).content[0].text);
@@ -97,7 +98,7 @@ describe('hybrid memory_search', () => {
       expect(out.results.some((r) => r.id === 'authority')).toBe(true);
       await c2.close?.();
     } finally {
-      bad.kill('SIGTERM');
+      await terminateChild(bad);
     }
   }, 120000);
 
@@ -253,7 +254,7 @@ describe('hybrid memory_search', () => {
       expect(JSON.parse(raw.content[0].text).ok).toBe(true);
       await c3.close?.();
     } finally {
-      bad.kill('SIGTERM');
+      await terminateChild(bad);
     }
 
     // Nothing in the store still holds a vector for the abandoned body, and

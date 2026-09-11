@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import Redis from 'ioredis';
+import { terminateChild } from './helpers/compact-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, '..', 'server.js');
@@ -120,8 +121,7 @@ describe('memory-mcp server', () => {
   });
 
   afterAll(async () => {
-    proc.kill('SIGTERM');
-    await new Promise((r) => proc.on('exit', r));
+    await terminateChild(proc);
   });
 
   // --------------------------------------------------------------------------
@@ -1516,8 +1516,7 @@ describe('memory-mcp configured retention and soft cap', () => {
   });
 
   afterAll(async () => {
-    proc.kill('SIGTERM');
-    await new Promise((r) => proc.on('exit', r));
+    await terminateChild(proc);
   });
 
   it('the operation_id description reflects the configured retention window', async () => {
@@ -1584,8 +1583,7 @@ describe('memory-mcp auth', () => {
   });
 
   afterAll(async () => {
-    proc.kill('SIGTERM');
-    await new Promise((r) => proc.on('exit', r));
+    await terminateChild(proc);
   });
 
   it('POST /mcp without token returns 401', async () => {

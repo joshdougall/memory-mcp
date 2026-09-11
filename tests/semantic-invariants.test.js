@@ -10,6 +10,7 @@ import { getChunks } from '../semantic/chunkstore.js';
 import { embedQuery, MODEL_ID } from '../semantic/embedder.js';
 import { bestChunk, keywordScore } from '../semantic/rank.js';
 import { BACKLINK_START, BACKLINK_END } from '../compact/graph.js';
+import { terminateChild } from './helpers/compact-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VALKEY = 'redis://127.0.0.1:6379/5';
@@ -54,7 +55,7 @@ afterAll(async () => {
   await client?.close?.();
   await redis.flushdb();
   await redis.quit();
-  proc?.kill('SIGTERM');
+  if (proc) await terminateChild(proc);
 });
 
 beforeEach(async () => { await redis.flushdb(); });
