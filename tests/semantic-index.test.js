@@ -61,4 +61,25 @@ describe('indexEntry', () => {
     expect(await redis.sismember('memdirty', 'e1')).toBe(1);
     expect(await getChunks(redis, 'e1')).toEqual([]);
   });
+
+  it('clears stale chunks when a re-indexed entry becomes only a generated block', async () => {
+    // Index real content first: this must leave chunk keys and an index-set
+    // key behind.
+    await indexEntry(redis, 'e1', { title: 'T', body: 'real content here', ttl: null });
+    const before = await getChunks(redis, 'e1');
+    expect(before.length).toBeGreaterThan(0);
+    expect((await redis.keys('memchunk:e1:*')).length).toBeGreaterThan(0);
+    expect(await redis.exists('memchunks:e1')).toBe(1);
+
+    // Re-index the same id with a body that is now only a generated block.
+    // The old chunks describe text this entry no longer carries, so a search
+    // must not be able to find them.
+    const body = `${BACKLINK_START}\n- [[x]]\n${BACKLINK_END}`;
+    const out = await indexEntry(redis, 'e1', { title: 'T', body, ttl: null });
+
+    expect(out.chunks).toBe(0);
+    expect(await getChunks(redis, 'e1')).toEqual([]);
+    expect(await redis.keys('memchunk:e1:*')).toEqual([]);
+    expect(await redis.exists('memchunks:e1')).toBe(0);
+  }, 120000);
 });
