@@ -36,9 +36,28 @@ export async function backfill(redis, { onlyDirty = false, embedder } = {}) {
         // retry. Chunks left over from an older model are not current, so
         // they fall through and get re-embedded rather than skipped forever.
         const existing = await getChunks(redis, id);
-        if (existing.length > 0 && existing.every((c) => c.model === MODEL_ID)) {
-          skipped += 1;
-          continue;
+        const currentAndReadable = existing.length > 0
+          && existing.every((c) => c.model === MODEL_ID);
+        if (currentAndReadable) {
+          // `memchunks:<id>` is the source of truth for how many chunks this
+          // entry has. `putChunks` only grows it once every individual chunk
+          // hash for the new version is already written (the SADD is the
+          // last command in its pipeline), so a crash mid-write cannot leave
+          // it listing more members than we can read back for a version that
+          // was never fully written in the first place: the set would still
+          // be empty (or hold the prior version), and `existing.length`
+          // would be 0. What a crash CAN leave behind is a stale set from an
+          // interrupted delete-then-rewrite of an earlier version, where
+          // some of that version's chunk hashes were removed before the crash
+          // and others were not, while the set itself (its own delete is
+          // last too) still lists all of them. Comparing the set's real
+          // cardinality against what we could actually read catches that: a
+          // complete entry has the two agree, a partial one does not.
+          const total = await redis.scard(`memchunks:${id}`);
+          if (total === existing.length) {
+            skipped += 1;
+            continue;
+          }
         }
       }
 
