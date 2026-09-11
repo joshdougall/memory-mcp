@@ -40,7 +40,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
+      # Temporary: the suite passes but the process will not exit. The
+      # hanging-process reporter names the handles still open at teardown.
+      - run: npx vitest run --reporter=default --reporter=hanging-process
         env:
           VALKEY_URL: redis://127.0.0.1:6379/10
 
