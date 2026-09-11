@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import Redis from 'ioredis';
-import { indexEntry } from './semantic/index.js';
+import { indexEntry, indexedBody } from './semantic/index.js';
 import { getChunks, deleteChunks } from './semantic/chunkstore.js';
 import { embedQuery } from './semantic/embedder.js';
 import { bestChunk, keywordScore, blend } from './semantic/rank.js';
@@ -436,7 +436,7 @@ function buildMcpServer() {
 
   server.tool(
     'memory_search',
-    'Search memories by tag intersection, type, or project, optionally ranked by a query. Tag, type and project are filters. The query is not a filter: it scores entries by meaning and by keyword, and results come back most relevant first. With no query, entries are sorted by hits desc then updated desc.',
+    'Search memories by tag intersection, type, or project, optionally ranked by a query. Tag, type and project are filters. The query is not a filter: it scores entries by meaning and by keyword, and results come back most relevant first. With no query, entries are sorted by hits desc then updated desc. A ranked result carries an excerpt plus chunkRange {start, end, source}; source names the field the offsets index into, so excerpt always equals result[source].slice(start, end).',
     {
       tags: z.array(z.string()).optional().describe('Tag names to intersect (all must match)'),
       type: z.string().optional().describe('Filter by memory type (pattern, decision, reference, feedback, incident, project, entity, state)'),
@@ -521,8 +521,22 @@ function buildMcpServer() {
           entry.vectorScore = Number(vectorScore.toFixed(4));
           entry.score = Number(blend(vectorScore, textScore).toFixed(4));
           if (best) {
+            // chunkRange indexes into the string that was chunked, which is
+            // the body with any managed backlink block stripped out, not the
+            // raw body returned above. Translating the offsets back into raw
+            // coordinates is not possible in general: a chunk spanning the
+            // removed block is text from both sides joined together, so no
+            // offset pair into the raw body slices to it. Name the field the
+            // offsets belong to instead, and carry that field when it is not
+            // `body`, so a caller can always check
+            // `entry[entry.chunkRange.source].slice(start, end) === excerpt`
+            // without guessing. Only entries that actually carry a managed
+            // block pay for the extra copy.
+            const indexed = indexedBody(entry.body);
+            const source = indexed === entry.body ? 'body' : 'indexedBody';
             entry.excerpt = best.chunk.text;
-            entry.chunkRange = { start: best.chunk.start, end: best.chunk.end };
+            if (source === 'indexedBody') entry.indexedBody = indexed;
+            entry.chunkRange = { start: best.chunk.start, end: best.chunk.end, source };
           }
           results.push(entry);
         }
