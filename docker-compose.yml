@@ -53,7 +53,11 @@ services:
       OPERATION_ID_TTL_SECONDS: "${MEMORY_MCP_OPERATION_ID_TTL_SECONDS:-604800}"
     ports:
       - "${MEMORY_MCP_BIND:-127.0.0.1}:${MEMORY_MCP_HOST_PORT:-3106}:${MEMORY_MCP_PORT:-8000}"
-    mem_limit: ${MEMORY_MCP_MEM_LIMIT:-256m}
+    # Measured on a real server process with the embedding model loaded:
+    # 112 MB idle, 247 MB after the first embed, 260 MB after ten searches.
+    # 256m predates the model and gets the container OOM-killed on the first
+    # write or search after a deploy. Do not lower this.
+    mem_limit: ${MEMORY_MCP_MEM_LIMIT:-512m}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8000)+'/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

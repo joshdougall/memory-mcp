@@ -799,8 +799,13 @@ function buildMcpServer() {
       // gone from the entry. Best effort, like memory_set, so an index failure
       // cannot undo a rollback that already landed. 'KEEP' left whatever
       // expiry the live entry had, so the ttl is read back rather than assumed.
+      //
+      // Read the REMAINING seconds, not the `ttl` field, which records the
+      // configured lifetime and stopped counting the moment it was written.
+      // The backfill already uses remaining, and it is the safe side: chunks
+      // that die with the entry rather than outliving it.
       try {
-        const liveTtl = parseInt(await redis.hget(`mem:${id}`, 'ttl') || '0', 10);
+        const liveTtl = await redis.ttl(`mem:${id}`);
         await indexEntry(redis, id, {
           title: version.title || '',
           body: version.body || '',

@@ -82,4 +82,26 @@ describe('indexEntry', () => {
     expect(await redis.keys('memchunk:e1:*')).toEqual([]);
     expect(await redis.exists('memchunks:e1')).toBe(0);
   }, 120000);
+
+  it('clears the previous version chunks when an update fails to embed', async () => {
+    // Index a real body, then update the same id with an embedder that
+    // throws. The old vectors describe text the entry no longer has, so
+    // leaving them behind would let a healthy server rank this entry on the
+    // abandoned body and quote it as the excerpt. Vector-unfindable is the
+    // correct failure here, and the entry is still reachable by keyword.
+    await indexEntry(redis, 'e1', { title: 'T', body: 'the camper trailer needs new tyres', ttl: null });
+    expect((await getChunks(redis, 'e1')).length).toBeGreaterThan(0);
+
+    const boom = { embedPassages: vi.fn().mockRejectedValue(new Error('model gone')) };
+    const out = await indexEntry(
+      redis, 'e1', { title: 'T', body: 'postgres connection pooling settings', ttl: null }, boom,
+    );
+
+    expect(out.skipped).toBe('model gone');
+    expect(await redis.sismember('memdirty', 'e1')).toBe(1);
+    // No vector from the abandoned body survives, in any form.
+    expect(await getChunks(redis, 'e1')).toEqual([]);
+    expect(await redis.keys('memchunk:e1:*')).toEqual([]);
+    expect(await redis.exists('memchunks:e1')).toBe(0);
+  }, 120000);
 });

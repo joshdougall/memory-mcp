@@ -40,6 +40,16 @@ export async function indexEntry(redis, id, { title, body, ttl }, embedder = def
   } catch (err) {
     // A write must never fail because the model did. Record it and move on,
     // the backfill drains the dirty set later.
+    //
+    // Drop the previous version's chunks first. They describe text this entry
+    // no longer carries, so leaving them lets an update whose embed failed
+    // rank on the old body and quote it back, breaking the promise that an
+    // excerpt is a slice of the entry it came from. Unfindable by vector is
+    // the better failure than findable by the wrong text, and the entry is
+    // still reachable by keyword either way. Nor would it self-heal: a full
+    // backfill sees a complete current-model chunk set and skips the entry,
+    // so only the dirty set would ever repair it.
+    await deleteChunks(redis, id);
     await markDirty(redis, id);
     return { chunks: 0, skipped: err.message };
   }

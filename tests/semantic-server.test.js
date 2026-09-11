@@ -219,6 +219,96 @@ describe('hybrid memory_search', () => {
     }
   }, 120000);
 
+  it('drops the previous vectors when an update cannot be embedded', async () => {
+    // Write the first body through the healthy server, so the entry really is
+    // indexed before anything goes wrong.
+    await call('memory_set', {
+      id: 'stale-vectors', title: 'Trailer notes',
+      body: 'the camper trailer needs new tyres before the desert crossing',
+      type: 'reference', tags: ['stale'],
+    });
+    expect((await redis.smembers('memchunks:stale-vectors')).length).toBeGreaterThan(0);
+
+    // Update the same entry through a server whose embedding model is gone.
+    // The write must still land, and the vectors for the body it just
+    // abandoned must not survive it.
+    const breaker = pathToFileURL(join(__dirname, 'helpers', 'break-embedder.mjs')).href;
+    const bad = spawn(process.execPath, ['--import', breaker, join(__dirname, '..', 'server.js')], {
+      env: { ...process.env, PORT: String(PORT + 2), VALKEY_URL: VALKEY },
+      stdio: 'pipe',
+    });
+    bad.stdout.on('data', () => {}); bad.stderr.on('data', () => {});
+    try {
+      await waitForHealth(PORT + 2);
+      const c3 = new Client({ name: 'broken-writer', version: '1.0.0' });
+      await c3.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT + 2}/mcp`)));
+      const raw = await c3.callTool({
+        name: 'memory_set',
+        arguments: {
+          id: 'stale-vectors', title: 'Trailer notes',
+          body: 'postgres connection pooling settings for the api',
+          type: 'reference', tags: ['stale'],
+        },
+      });
+      expect(JSON.parse(raw.content[0].text).ok).toBe(true);
+      await c3.close?.();
+    } finally {
+      bad.kill('SIGTERM');
+    }
+
+    // Nothing in the store still holds a vector for the abandoned body, and
+    // the entry is queued for repair.
+    expect(await redis.keys('memchunk:stale-vectors:*')).toEqual([]);
+    expect(await redis.exists('memchunks:stale-vectors')).toBe(0);
+    expect(await redis.sismember('memdirty', 'stale-vectors')).toBe(1);
+
+    // So a healthy server can neither rank it on, nor quote, text it no
+    // longer has.
+    const stale = await call('memory_search', { query: 'vehicle wheels need replacing', limit: 20 });
+    const staleHit = stale.results.find((r) => r.id === 'stale-vectors');
+    expect(staleHit?.excerpt || '').not.toContain('tyres');
+    expect(staleHit?.vectorScore || 0).toBe(0);
+
+    // Temporarily unfindable by vector is the trade. The entry stays reachable
+    // by keyword on the body it actually has.
+    const kw = await call('memory_search', { query: 'postgres connection pooling settings', limit: 20 });
+    const hit = kw.results.find((r) => r.id === 'stale-vectors');
+    expect(hit).toBeDefined();
+    expect(hit.textScore).toBeGreaterThan(0);
+  }, 120000);
+
+  it('re-indexes after a rollback at the remaining ttl, not the configured one', async () => {
+    await call('memory_set', {
+      id: 'ttl-rolled', title: 'Ttl notes', body: 'first body about valkey eviction policies',
+      type: 'reference', tags: ['ttl'], ttl: 600,
+    });
+    await call('memory_set', {
+      id: 'ttl-rolled', title: 'Ttl notes', body: 'second body about disk snapshot scheduling',
+      type: 'reference', tags: ['ttl'], ttl: 600,
+    });
+
+    // Shorten the live expiry without touching the `ttl` field, which records
+    // the configured lifetime and never counts down. Every entry drifts into
+    // this state as its life elapses; the gap is just exaggerated here so the
+    // two readings cannot be mistaken for each other.
+    await redis.expire('mem:ttl-rolled', 30);
+    expect(await redis.hget('mem:ttl-rolled', 'ttl')).toBe('600');
+
+    const history = await call('memory_history', { id: 'ttl-rolled', limit: 10 });
+    const index = history.versions.findIndex((v) => (v.body || '').includes('eviction'));
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect((await call('memory_rollback', { id: 'ttl-rolled', version_index: index })).ok).toBe(true);
+
+    // Chunks must not outlive the entry they describe.
+    const keys = await redis.smembers('memchunks:ttl-rolled');
+    expect(keys.length).toBeGreaterThan(0);
+    for (const key of [...keys, 'memchunks:ttl-rolled']) {
+      const remaining = await redis.ttl(key);
+      expect(remaining).toBeGreaterThan(0);
+      expect(remaining).toBeLessThanOrEqual(30);
+    }
+  }, 120000);
+
   it('leaves no chunk keys behind when an entry is deleted', async () => {
     await call('memory_set', {
       id: 'deletable', title: 'Temporary', body: 'a body long enough to produce at least one chunk vector',
