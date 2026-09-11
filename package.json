@@ -10,6 +10,7 @@
     "lint": "eslint server.js"
   },
   "dependencies": {
+    "@huggingface/transformers": "4.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "ioredis": "^5.10.1",
     "prom-client": "^15.1.3",

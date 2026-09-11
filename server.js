@@ -8,6 +8,10 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import Redis from 'ioredis';
+import { indexEntry, indexedBody } from './semantic/index.js';
+import { getChunks, deleteChunks } from './semantic/chunkstore.js';
+import { embedQuery } from './semantic/embedder.js';
+import { bestChunk, keywordScore, blend } from './semantic/rank.js';
 import {
   Registry,
   Gauge,
@@ -432,12 +436,12 @@ function buildMcpServer() {
 
   server.tool(
     'memory_search',
-    'Search memories by tag intersection, type, project, or text substring. Returns entries sorted by hits desc then updated desc.',
+    'Search memories by tag intersection, type, or project, optionally ranked by a query. Tag, type and project are filters. The query is not a filter: it scores entries by meaning and by keyword, and results come back most relevant first. With no query, entries are sorted by hits desc then updated desc. A ranked result carries an excerpt plus chunkRange {start, end, source}; source names the field the offsets index into, so excerpt always equals result[source].slice(start, end).',
     {
       tags: z.array(z.string()).optional().describe('Tag names to intersect (all must match)'),
       type: z.string().optional().describe('Filter by memory type (pattern, decision, reference, feedback, incident, project, entity, state)'),
       project: z.string().optional().describe('Filter by project name (empty string for cross-project)'),
-      query: z.string().optional().describe('Substring to match against title and body'),
+      query: z.string().optional().describe('Natural language query. Ranks entries by semantic similarity blended with a keyword match against title and body. Omit to list without ranking.'),
       limit: z.number().int().positive().optional().default(20).describe('Maximum results to return'),
     },
     async ({ tags, type, project, query, limit }) => {
@@ -479,32 +483,83 @@ function buildMcpServer() {
           candidateKeys = new Set(allKeys);
         }
 
+        // The query is embedded once, not per candidate. A failure here is a
+        // worse answer, not a failed one: scoring falls back to keywords alone
+        // and the response says so.
+        let queryVector = null;
+        let degraded = null;
+        if (query) {
+          try {
+            queryVector = await embedQuery(query);
+          } catch (err) {
+            degraded = `semantic search unavailable: ${err.message}`;
+          }
+        }
+
         const results = [];
         for (const key of candidateKeys) {
           const raw = await redis.hgetall(key);
           if (!raw || !raw.title) continue;
-
-          if (query) {
-            const q = query.toLowerCase();
-            if (!raw.title.toLowerCase().includes(q) && !(raw.body || '').toLowerCase().includes(q)) {
-              continue;
-            }
-          }
-
           const id = key.replace(/^mem:/, '');
-          results.push({ id, ...entryToObject(raw) });
+          const entry = { id, ...entryToObject(raw) };
+
+          if (!query) { results.push(entry); continue; }
+
+          const textScore = keywordScore(query, raw.title, raw.body, id);
+          let vectorScore = 0;
+          let best = null;
+          if (queryVector) {
+            // An entry with no stored chunks (written before this feature, or
+            // still waiting on the backfill) simply scores zero here rather
+            // than erroring.
+            best = bestChunk(queryVector, await getChunks(redis, id));
+            if (best) vectorScore = best.score;
+          }
+          if (textScore === 0 && vectorScore <= 0) continue;
+
+          entry.textScore = Number(textScore.toFixed(4));
+          entry.vectorScore = Number(vectorScore.toFixed(4));
+          entry.score = Number(blend(vectorScore, textScore).toFixed(4));
+          if (best) {
+            // chunkRange indexes into the string that was chunked, which is
+            // the body with any managed backlink block stripped out, not the
+            // raw body returned above. Translating the offsets back into raw
+            // coordinates is not possible in general: a chunk spanning the
+            // removed block is text from both sides joined together, so no
+            // offset pair into the raw body slices to it. Name the field the
+            // offsets belong to instead, and carry that field when it is not
+            // `body`, so a caller can always check
+            // `entry[entry.chunkRange.source].slice(start, end) === excerpt`
+            // without guessing. Only entries that actually carry a managed
+            // block pay for the extra copy.
+            const indexed = indexedBody(entry.body);
+            const source = indexed === entry.body ? 'body' : 'indexedBody';
+            entry.excerpt = best.chunk.text;
+            if (source === 'indexedBody') entry.indexedBody = indexed;
+            entry.chunkRange = { start: best.chunk.start, end: best.chunk.end, source };
+          }
+          results.push(entry);
         }
 
-        results.sort((a, b) => {
-          if (b.hits !== a.hits) return b.hits - a.hits;
-          return (b.updated || '').localeCompare(a.updated || '');
-        });
+        if (query) {
+          // Relevance replaces the hits sort whenever there is something to be
+          // relevant to. With no query the old ordering is untouched.
+          results.sort((a, b) => b.score - a.score);
+        } else {
+          results.sort((a, b) => {
+            if (b.hits !== a.hits) return b.hits - a.hits;
+            return (b.updated || '').localeCompare(a.updated || '');
+          });
+        }
 
         const limited = results.slice(0, limit || 20);
         if (limited.length === 0) metricSearchEmptyTotal.inc();
 
+        const payload = { count: limited.length, results: limited };
+        if (degraded) payload.degraded = degraded;
+
         return {
-          content: [{ type: 'text', text: JSON.stringify({ count: limited.length, results: limited }, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
         };
       } finally {
         end();
@@ -586,6 +641,16 @@ function buildMcpServer() {
 
       metricWriteTotal.inc();
 
+      // Indexing is best effort and deliberately after the write. indexEntry
+      // already swallows an embedder failure and marks the entry dirty for the
+      // backfill; this catch covers the rest, chiefly a Valkey failure inside
+      // putChunks. A stored memory must never be lost to a search-side problem.
+      try {
+        await indexEntry(redis, id, { title, body, ttl });
+      } catch (err) {
+        console.error(`[semantic] index failed for ${id}:`, err.message);
+      }
+
       const warning = await entryCountWarning();
 
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: result.operation, revision: result.revision, warning }, null, 2) }] };
@@ -652,6 +717,16 @@ function buildMcpServer() {
       if (result.status === 'not_found') {
         return { content: [{ type: 'text', text: JSON.stringify({ error: `Not found: ${id}` }) }] };
       }
+
+      // Chunks outlive the entry otherwise. Search cannot reach them, since
+      // candidates come from the entry keys and the indexes, so this is a
+      // storage leak rather than a wrong answer, but it is unbounded.
+      try {
+        await deleteChunks(redis, id);
+      } catch (err) {
+        console.error(`[semantic] chunk cleanup failed for ${id}:`, err.message);
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation: 'deleted', revision: result.revision }, null, 2) }] };
     }
   );
@@ -717,6 +792,28 @@ function buildMcpServer() {
         operation
       ));
       metricWriteTotal.inc();
+
+      // A rollback rewrites the body, so the chunks describe text the entry no
+      // longer has until it is re-indexed. Inline rather than markDirty: a
+      // dirty flag leaves a window in which search quotes an excerpt that is
+      // gone from the entry. Best effort, like memory_set, so an index failure
+      // cannot undo a rollback that already landed. 'KEEP' left whatever
+      // expiry the live entry had, so the ttl is read back rather than assumed.
+      //
+      // Read the REMAINING seconds, not the `ttl` field, which records the
+      // configured lifetime and stopped counting the moment it was written.
+      // The backfill already uses remaining, and it is the safe side: chunks
+      // that die with the entry rather than outliving it.
+      try {
+        const liveTtl = await redis.ttl(`mem:${id}`);
+        await indexEntry(redis, id, {
+          title: version.title || '',
+          body: version.body || '',
+          ttl: liveTtl > 0 ? liveTtl : undefined,
+        });
+      } catch (err) {
+        console.error(`[semantic] index failed for ${id} after rollback:`, err.message);
+      }
 
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id, operation, restored_from: version.updated || 'unknown', revision: result.revision }, null, 2) }] };
     }
