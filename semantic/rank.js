@@ -1,6 +1,9 @@
 // Embeddings arrive normalised from the embedder, so cosine similarity is a
 // plain dot product. Re-normalising here would be a silent no-op per comparison.
 export function dot(a, b) {
+  if (a.length !== b.length) {
+    throw new Error(`Vector dimension mismatch: ${a.length} vs ${b.length}`);
+  }
   let s = 0;
   for (let i = 0; i < a.length; i += 1) s += a[i] * b[i];
   return s;

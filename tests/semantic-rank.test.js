@@ -8,6 +8,12 @@ describe('dot', () => {
     expect(dot(unit(1, 0), unit(1, 0))).toBeCloseTo(1, 6);
     expect(dot(unit(1, 0), unit(0, 1))).toBeCloseTo(0, 6);
   });
+  it('throws when the first vector is longer', () => {
+    expect(() => dot(unit(1, 0, 0), unit(1, 0))).toThrow();
+  });
+  it('throws when the second vector is longer', () => {
+    expect(() => dot(unit(1, 0), unit(1, 0, 0))).toThrow();
+  });
 });
 
 describe('keywordScore', () => {
@@ -28,11 +34,12 @@ describe('bestChunk', () => {
   it('returns the highest scoring chunk and its score', () => {
     const q = unit(1, 0);
     const chunks = [
-      { text: 'far', vector: unit(0, 1) },
-      { text: 'near', vector: unit(1, 0.05) },
+      { text: 'worst', vector: unit(0, 1) },
+      { text: 'best', vector: unit(1, 0.05) },
+      { text: 'bad', vector: unit(-1, 0) },
     ];
     const out = bestChunk(q, chunks);
-    expect(out.chunk.text).toBe('near');
+    expect(out.chunk.text).toBe('best');
     expect(out.score).toBeGreaterThan(0.9);
   });
   it('returns null when there are no chunks or no query vector', () => {
