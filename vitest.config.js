@@ -17,5 +17,15 @@ export default defineConfig({
     // the defaults rather than replacing them, or node_modules stops being
     // excluded.
     exclude: [...configDefaults.exclude, '**/.claude/**'],
+    // Under CI the suite passes in about 16 seconds and then never exits:
+    // every file reports, no summary line is printed, and the job sits until
+    // it is killed. The orphans reaped at that point are the vitest workers
+    // themselves, so the files are done and the pool never closes. Running
+    // every file in one fork sidesteps that. It costs roughly 13 seconds
+    // locally, which is why it is not on everywhere. vitest is pinned at
+    // ^2.0.0 and resolves to 2.1.9; upgrading it is the real fix and is
+    // tracked separately.
+    pool: 'forks',
+    poolOptions: { forks: { singleFork: Boolean(process.env.CI) } },
   },
 })
