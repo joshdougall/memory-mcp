@@ -14,6 +14,14 @@ COPY --chown=node:node semantic ./semantic
 COPY --chown=node:node compact ./compact
 COPY --chown=node:node scripts ./scripts
 
+# transformers.js caches the model inside its own package directory at run
+# time. npm ci runs as root, so that tree is root owned and the node user
+# cannot create the cache: every embed then fails with EACCES and search
+# silently degrades to keyword only. The Docker build job only builds the
+# image, it never runs it, so nothing in CI catches this.
+RUN mkdir -p node_modules/@huggingface/transformers/.cache \
+ && chown -R node:node node_modules/@huggingface/transformers/.cache
+
 EXPOSE 8000
 USER node
 CMD ["node", "server.js"]
