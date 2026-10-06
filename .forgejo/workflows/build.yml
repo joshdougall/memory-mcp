@@ -1,7 +1,7 @@
 name: Build image
 
-# Self-hosted Forgejo builds. Needs a runner with Docker on ubuntu-latest and a
-# PACKAGE_TOKEN secret with write:package.
+# Needs Docker on ubuntu-latest and a PACKAGE_TOKEN secret (write:package).
+# Optional TAG_SIGNING_KEY (armored public key, needs gpg): only build tags it signed.
 
 on:
   push:
@@ -17,11 +17,18 @@ jobs:
       - name: Build
         env:
           TOKEN: ${{ github.token }}
+          TAG_SIGNING_KEY: ${{ secrets.TAG_SIGNING_KEY }}
         run: |
           set -euo pipefail
           git -c http.extraHeader="Authorization: token $TOKEN" clone -q --depth 1 \
             --branch "$GITHUB_REF_NAME" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" src
           cd src
+          if [ -n "$TAG_SIGNING_KEY" ]; then
+            # Fresh keyring holding only the trusted key(s).
+            export GNUPGHOME="$(mktemp -d)"
+            echo "$TAG_SIGNING_KEY" | gpg --batch --quiet --import
+            git verify-tag "$GITHUB_REF_NAME"
+          fi
           REGISTRY="${GITHUB_SERVER_URL#*://}"
           REGISTRY="${REGISTRY%/}"
           IMAGE="$REGISTRY/$GITHUB_REPOSITORY"
