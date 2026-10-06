@@ -2,6 +2,7 @@ name: Build image
 
 # Needs Docker on ubuntu-latest and a PACKAGE_TOKEN secret (write:package).
 # Optional TAG_SIGNING_KEY (armored public key, needs gpg): only build tags it signed.
+# Optional REGISTRY variable: the registry host, if not the runner's server URL.
 
 on:
   push:
@@ -18,6 +19,7 @@ jobs:
         env:
           TOKEN: ${{ github.token }}
           TAG_SIGNING_KEY: ${{ secrets.TAG_SIGNING_KEY }}
+          REGISTRY: ${{ vars.REGISTRY }}
         run: |
           set -euo pipefail
           git -c http.extraHeader="Authorization: token $TOKEN" clone -q --depth 1 \
@@ -29,7 +31,7 @@ jobs:
             echo "$TAG_SIGNING_KEY" | gpg --batch --quiet --import
             git verify-tag "$GITHUB_REF_NAME"
           fi
-          REGISTRY="${GITHUB_SERVER_URL#*://}"
+          REGISTRY="${REGISTRY:-${GITHUB_SERVER_URL#*://}}"
           REGISTRY="${REGISTRY%/}"
           IMAGE="$REGISTRY/$GITHUB_REPOSITORY"
           VERSION="${GITHUB_REF_NAME#v}"
