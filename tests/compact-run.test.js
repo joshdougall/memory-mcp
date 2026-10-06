@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { startEnv } from './helpers/compact-env.js';
 import { run, EXIT } from '../compact/compact.js';
@@ -105,6 +105,9 @@ describe('run', () => {
   });
 
   it('returns EXIT.LOCAL when the log directory cannot be created', async () => {
-    expect(await run(opts({ dir: '/proc/nope/nowhere' }))).toBe(EXIT.LOCAL);
+    // Not /proc: Node's recursive mkdir never returns there on Linux.
+    const file = join(env.dir, 'not-a-dir');
+    writeFileSync(file, '');
+    expect(await run(opts({ dir: join(file, 'nowhere') }))).toBe(EXIT.LOCAL);
   });
 });
