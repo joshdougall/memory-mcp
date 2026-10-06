@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { startEnv } from './helpers/compact-env.js';
 import { run, EXIT } from '../compact/compact.js';
@@ -105,6 +105,13 @@ describe('run', () => {
   });
 
   it('returns EXIT.LOCAL when the log directory cannot be created', async () => {
-    expect(await run(opts({ dir: '/proc/nope/nowhere' }))).toBe(EXIT.LOCAL);
+    // A path under a regular file fails with ENOTDIR on every platform. Do not
+    // use a path under /proc: on Linux, Node's recursive mkdir never returns
+    // there, which blocks the event loop so no test timeout can fire. That is
+    // what hung CI from 2026-09-03 while passing on macOS, where /proc does not
+    // exist and the mkdir fails at once.
+    const file = join(env.dir, 'not-a-dir');
+    writeFileSync(file, '');
+    expect(await run(opts({ dir: join(file, 'nowhere') }))).toBe(EXIT.LOCAL);
   });
 });
