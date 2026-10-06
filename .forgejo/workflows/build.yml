@@ -1,0 +1,46 @@
+name: Build image
+
+# Self-hosted Forgejo builds. Needs a runner with Docker on ubuntu-latest and a
+# PACKAGE_TOKEN secret with write:package.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Build
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git -c http.extraHeader="Authorization: token $TOKEN" clone -q --depth 1 \
+            --branch "$GITHUB_REF_NAME" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" src
+          cd src
+          REGISTRY="${GITHUB_SERVER_URL#*://}"
+          REGISTRY="${REGISTRY%/}"
+          IMAGE="$REGISTRY/$GITHUB_REPOSITORY"
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "REGISTRY=$REGISTRY"
+            echo "IMAGE=$IMAGE"
+            echo "VERSION=$VERSION"
+          } >> "$GITHUB_ENV"
+          docker build --pull -t "$IMAGE:$VERSION" .
+
+      - name: Push
+        env:
+          PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Per-job config: a host-mode runner shares one across jobs.
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          echo "$PACKAGE_TOKEN" | docker login "$REGISTRY" -u "$GITHUB_REPOSITORY_OWNER" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION"
